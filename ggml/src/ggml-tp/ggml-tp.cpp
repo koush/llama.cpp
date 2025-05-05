@@ -66,46 +66,11 @@ static ggml_tensor * unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *,
     return wrapped;
 }
 
-// static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-//     auto be = ggml_parallel_backends[0];
-
-
-//     size_t buf_size = ggml_tensor_overhead()*(cgraph->n_nodes) + ggml_graph_overhead_custom(cgraph->n_nodes, false);
-
-//     struct ggml_init_params params = {
-//         /*.mem_size   =*/ buf_size,
-//         /*.mem_buffer =*/ NULL,
-//         /*.no_alloc   =*/ true,
-//     };
-//     ggml_context_ptr ctx_ptr { ggml_init(params) };
-//     GGML_ASSERT(ctx_ptr != nullptr);
-//     ggml_context * ctx = ctx_ptr.get();
-//     struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, cgraph->n_nodes, false);
-//     graph->n_nodes = cgraph->n_nodes;
-//     std::map<ggml_tensor*, ggml_tensor*> tensor_map;
-//     for (int i = 0; i < cgraph->n_nodes; i++) {
-//         graph->nodes[i] = unwrap_tensor(cgraph->nodes[i], tensor_map);
-//     }
-//     ggml_status status = ggml_backend_graph_compute(be, graph);
-//     return GGML_STATUS_SUCCESS;
-// }
-
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto be = ggml_parallel_backends[0];
 
 
     size_t buf_size = ggml_tensor_overhead()*(cgraph->n_nodes) + ggml_graph_overhead_custom(cgraph->n_nodes, false);
-
-    // struct ggml_init_params params = {
-    //     /*.mem_size   =*/ buf_size,
-    //     /*.mem_buffer =*/ NULL,
-    //     /*.no_alloc   =*/ true,
-    // };
-    // ggml_context_ptr ctx_ptr { ggml_init(params) };
-    // GGML_ASSERT(ctx_ptr != nullptr);
-    // ggml_context * ctx = ctx_ptr.get();
-    // struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, cgraph->n_nodes, false);
-    // graph->n_nodes = cgraph->n_nodes;
     std::map<ggml_tensor*, ggml_tensor*> tensor_map;
     std::vector<ggml_tensor*> graph_nodes;
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -113,6 +78,9 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_status status = be->iface.node_compute(be, graph_nodes[i]);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
     }
     ggml_backend_synchronize(be);
     return GGML_STATUS_SUCCESS;
