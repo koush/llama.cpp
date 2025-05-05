@@ -2794,6 +2794,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+static enum ggml_status ggml_backend_cuda_node_compute(ggml_backend_t backend, ggml_tensor* node) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+#ifdef USE_CUDA_GRAPH
+    // Objects required for CUDA Graph
+    if (cuda_ctx->cuda_graph == nullptr) {
+        cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
+    }
+    cuda_ctx->cuda_graph->use_cpy_indirection = false;
+#endif
+
+    bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+    if (!ok) {
+        GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+    }
+    GGML_ASSERT(ok);
+    return GGML_STATUS_SUCCESS;
+}
+
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
@@ -2831,6 +2851,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
+    /* .node_compute            = */ ggml_backend_cuda_node_compute,
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
 };

@@ -57,6 +57,10 @@
 #include "ggml-rpc.h"
 #endif
 
+#ifdef GGML_USE_TP
+#include "ggml-tp.h"
+#endif
+
 #ifdef GGML_USE_CANN
 #include "ggml-cann.h"
 #endif
@@ -186,6 +190,25 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_KOMPUTE
         register_backend(ggml_backend_kompute_reg());
+#endif
+#ifdef GGML_USE_TP
+        auto tpreg = ggml_backend_tp_reg();
+
+        typedef bool (*ggml_backend_tp_set_backends_t)(std::vector<ggml_backend_reg_t> & backend_regs);
+        ggml_backend_tp_set_backends_t ggml_backend_tp_set_backends_fn = (ggml_backend_tp_set_backends_t) ggml_backend_reg_get_proc_address(ggml_backend_tp_reg(), "ggml_backend_tp_set_backends");
+        if (!ggml_backend_tp_set_backends_fn) {
+            throw std::invalid_argument("failed to find TensorParallel devices set function");
+        }
+
+        std::vector<ggml_backend_reg_t> backend_regs;
+        for (size_t i = 0; i < backends.size(); i++) {
+            backend_regs.push_back(backends[i].reg);
+        }
+        if (ggml_backend_tp_set_backends_fn(backend_regs)) {
+            backends.clear();
+            devices.clear();
+        }
+        register_backend(tpreg);
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
@@ -573,6 +596,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("kompute", silent, dir_path);
     ggml_backend_load_best("metal", silent, dir_path);
     ggml_backend_load_best("rpc", silent, dir_path);
+    ggml_backend_load_best("tp", silent, dir_path);
     ggml_backend_load_best("sycl", silent, dir_path);
     ggml_backend_load_best("vulkan", silent, dir_path);
     ggml_backend_load_best("opencl", silent, dir_path);

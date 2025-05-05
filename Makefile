@@ -596,6 +596,11 @@ ifdef GGML_RPC
 	OBJ_GGML_EXT += ggml/src/ggml-rpc.o
 endif # GGML_RPC
 
+ifdef GGML_TP
+	MK_CPPFLAGS  += -DGGML_USE_TP
+	OBJ_GGML_EXT += ggml/src/ggml-tp.o
+endif # GGML_TP
+
 OBJ_CUDA_TMPL      = $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/fattn-mma*.cu))
 OBJ_CUDA_TMPL     += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/mmq*.cu))
 
