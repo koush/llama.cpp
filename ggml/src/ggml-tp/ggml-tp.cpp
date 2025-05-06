@@ -30,6 +30,10 @@ struct ggml_backend_tp_context {
     std::string name;
 };
 
+struct ggml_tensor_parallel_extra {
+    ggml_tensor * tensor;
+};
+
 
 static const char * ggml_backend_tp_name(ggml_backend_t backend) {
     ggml_backend_tp_context * tp_ctx = (ggml_backend_tp_context *)backend->context;
@@ -53,7 +57,8 @@ static ggml_tensor * unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *,
     if (found != tensor_map.end()) {
         return found->second;
     }
-    ggml_tensor * wrapped = (ggml_tensor *)tensor->extra;
+    ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
+    auto wrapped = extra->tensor;
     tensor_map[tensor] = wrapped;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i] != nullptr) {
@@ -78,6 +83,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_status status = be->iface.node_compute(be, graph_nodes[i]);
+        // printf("op %d: %s\n", i, ggml_op_name(graph_nodes[i]->op));
         if (status != GGML_STATUS_SUCCESS) {
             return status;
         }
@@ -261,7 +267,8 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         }
     }
     else {
-        ggml_tensor * view_src = (ggml_tensor *)tensor->view_src->extra;
+        ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->view_src->extra;
+        auto view_src = extra->tensor;
         wrapped->data = (char *) view_src->data + tensor->view_offs;
         wrapped->view_src = view_src;
         wrapped->view_offs = tensor->view_offs;
@@ -271,21 +278,24 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         }
     }
 
-    tensor->extra = wrapped;
+    ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra {
+        /* .tensor = */ wrapped,
+    };
+    tensor->extra = extra;
 
     return ctx->wrapped->iface.init_tensor(ctx->wrapped, wrapped);
 }
 
 static void ggml_backend_tp_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
-    ggml_tensor * wrapped = (ggml_tensor *)tensor->extra;
-    ctx->wrapped->iface.set_tensor(ctx->wrapped, wrapped, data, offset, size);
+    ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
+    ctx->wrapped->iface.set_tensor(ctx->wrapped, extra->tensor, data, offset, size);
 }
 
 static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
-    ggml_tensor * wrapped = (ggml_tensor *)tensor->extra;
-    ctx->wrapped->iface.get_tensor(ctx->wrapped, wrapped, data, offset, size);
+    ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
+    ctx->wrapped->iface.get_tensor(ctx->wrapped, extra->tensor, data, offset, size);
 
     GGML_UNUSED(ctx);
     GGML_UNUSED(tensor);
