@@ -12,6 +12,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <numeric>
 
 
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
@@ -315,7 +316,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             auto base = (char *) backend_buffer->iface.get_base(backend_buffer);
             auto tensor_offset = (uint64_t) tensor->data - (uint64_t) 128;
             wrapped->data = base + tensor_offset;
-            auto size = backend_buffer->buft->iface.get_alloc_size(backend_buffer->buft, tensor);
         }
         else {
             ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->view_src->extra;
@@ -408,15 +408,15 @@ static ggml_backend_buffer_t ggml_backend_tp_buffer_type_alloc_buffer(ggml_backe
     return ggml_backend_buffer_init(buft, ggml_backend_tp_buffer_interface, ctx, size);
 }
 
-static size_t ggml_backend_tp_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[0])->iface.get_alignment(ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[0]));
-    GGML_UNUSED(buft);
-}
 
-static size_t ggml_backend_tp_get_max_size(ggml_backend_buffer_type_t buft) {
-    auto wrapped_buft = ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[0])->iface;
-    auto test = wrapped_buft.get_max_size(ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[0]));
-    return test;
+static size_t ggml_backend_tp_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    size_t lcm = 1;
+    for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
+        auto dev = ggml_parallel_devices[i];
+        auto buffer_type = dev->iface.get_buffer_type(dev);
+        lcm = std::lcm(lcm, buffer_type->iface.get_alignment(buffer_type));
+    }
+    return lcm;
     GGML_UNUSED(buft);
 }
 
@@ -434,7 +434,7 @@ static ggml_backend_buffer_type_i ggml_backend_tp_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_tp_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_tp_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_tp_buffer_type_get_alignment,
-    /* .get_max_size     = */ NULL,//ggml_backend_tp_get_max_size,
+    /* .get_max_size     = */ NULL,
     /* .get_alloc_size   = */ ggml_backend_tp_buffer_type_get_alloc_size,
     /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
 };
@@ -498,20 +498,49 @@ static bool is_split_compatible(ggml_op op) {
     }
 }
 
+static bool is_valid_op_and_buft(const ggml_tensor * op) {
+    if (!op || !op->buffer || !ggml_backend_buft_is_tp_split(op->buffer->buft)) {
+        return true;
+    }
+
+    // a splitable weight must have multiple rows.
+    if (op->ne[1] == 1) {
+        return false;
+    }
+
+    if (!is_split_compatible(op->op)) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
 
-    // split buffers can only be used with GGML_OP_MUL_MAT and some other basic ops
-    if (!is_split_compatible(op->op)) {
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_tp_split(op->src[i]->buffer->buft)) {
-                return false;
-            }
+    // this function is called by weight_buft_supported to determine to determine buft compatibility.
+    // the relevant check is not the tensor itself, but rather op->src[1] typically, which is the dummied weight being checked
+    // for compatiblity with the given buffer type.
+    // however, for thoroughness with upstream changes, check all tensors.
+    if (!is_valid_op_and_buft(op)) {
+        return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (!is_valid_op_and_buft(op->src[i])) {
+            return false;
         }
     }
 
-    return ggml_parallel_devices[0]->iface.supports_op(ggml_parallel_devices[0], op);
+    // the tensor must also be compatible with all the parallel devices.
+    for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
+        auto dev = ggml_parallel_devices[i];
+        if (!dev->iface.supports_op(dev, op)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool ggml_backend_tp_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
