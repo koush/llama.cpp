@@ -26,19 +26,17 @@ static ggml_guid_t ggml_backend_tp_guid() {
 
 
 struct ggml_backend_tp_context {
-    std::string endpoint;
-    std::string name;
 };
 
 struct ggml_tensor_parallel_extra {
     ggml_tensor * tensor;
+    int tp_candidate;
 };
 
 
 static const char * ggml_backend_tp_name(ggml_backend_t backend) {
-    ggml_backend_tp_context * tp_ctx = (ggml_backend_tp_context *)backend->context;
-
-    return tp_ctx->name.c_str();
+    return "TP";
+    GGML_UNUSED(backend);
 }
 
 static void ggml_backend_tp_free(ggml_backend_t backend) {
@@ -71,11 +69,56 @@ static ggml_tensor * unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *,
     return wrapped;
 }
 
+static void map_tp_candidates(ggml_tensor *tensor, std::vector<ggml_tensor *> & check) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (tensor->src[i] != nullptr) {
+            auto src = tensor->src[i];
+            if (!src) {
+                continue;
+            }
+            auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+            if (src_extra->tp_candidate) {
+                continue;
+            }
+
+            switch (src->op) {
+                // can handle some basic math ops
+                case GGML_OP_ADD:
+                case GGML_OP_SUB:
+                case GGML_OP_MUL:
+                case GGML_OP_DIV:
+                // split loaded weights if they're needed for 
+                case GGML_OP_NONE:
+                // test
+                case GGML_OP_RMS_NORM:
+                    break;
+                default:
+                    // printf("skipping %s\n", ggml_op_name(src->op));
+                    continue;
+            }
+            src_extra->tp_candidate = 1;
+            check.push_back(src);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto be = ggml_parallel_backends[0];
 
+    std::vector<ggml_tensor *> check;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * tensor = cgraph->nodes[i];
+        ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
+        extra->tp_candidate = tensor->op == GGML_OP_MUL_MAT;
+        check.push_back(tensor);
+    }
 
-    size_t buf_size = ggml_tensor_overhead()*(cgraph->n_nodes) + ggml_graph_overhead_custom(cgraph->n_nodes, false);
+    while (!check.empty()) {
+        auto tensor = check.back();
+        check.pop_back();
+        map_tp_candidates(tensor, check);
+    }
+
     std::map<ggml_tensor*, ggml_tensor*> tensor_map;
     std::vector<ggml_tensor*> graph_nodes;
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -90,6 +133,8 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     }
     ggml_backend_synchronize(be);
     return GGML_STATUS_SUCCESS;
+
+    GGML_UNUSED(backend);
 }
 
 static ggml_backend_i ggml_backend_tp_interface = {
@@ -113,8 +158,6 @@ static ggml_backend_dev_t ggml_backend_tp_reg_get_device(ggml_backend_reg_t reg,
 
 ggml_backend_t ggml_backend_tp_init(const char * endpoint) {
     ggml_backend_tp_context * ctx = new ggml_backend_tp_context {
-        /* .endpoint  = */ endpoint,
-        /* .name      = */ "TP[" + std::string(endpoint) + "]",
     };
 
     ggml_backend_t backend = new ggml_backend {
@@ -135,6 +178,8 @@ ggml_backend_t ggml_backend_tp_init(const char * endpoint) {
     }
 
     return backend;
+
+    GGML_UNUSED(endpoint);
 }
 
 
@@ -189,8 +234,7 @@ static void ggml_backend_tp_device_get_props(ggml_backend_dev_t dev, struct ggml
 
 
 struct ggml_backend_tp_buffer_type_context {
-    std::string endpoint;
-    std::string name;
+    bool split;
 };
 
 
@@ -198,6 +242,7 @@ struct ggml_backend_tp_buffer_context {
     void * base_ptr;
     uint64_t remote_ptr;
     ggml_backend_buffer_t wrapped;
+    bool split = false;
 };
 
 
@@ -212,8 +257,17 @@ static void * ggml_backend_tp_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static const char * ggml_backend_tp_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    ggml_backend_tp_buffer_type_context * buft_ctx = (ggml_backend_tp_buffer_type_context *)buft->context;
-    return buft_ctx->name.c_str();
+    return "TP";
+    GGML_UNUSED(buft);
+}
+
+static const char * ggml_backend_tp_split_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return "TPSplit";
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_buft_is_tp_split(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_tp_split_buffer_type_name;
 }
 
 static uint64_t max_ptr = 0;
@@ -280,6 +334,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
     ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra {
         /* .tensor = */ wrapped,
+        /* .tp_candidate = */ 0,
     };
     tensor->extra = extra;
 
@@ -333,6 +388,7 @@ static ggml_backend_buffer_i ggml_backend_tp_buffer_interface = {
 
 static ggml_backend_buffer_t ggml_backend_tp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_tp_buffer_context * ctx = new ggml_backend_tp_buffer_context();
+    ctx->split = ggml_backend_buft_is_tp_split(buft);
     auto buffer_type = ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[0]);
     ctx->wrapped = buffer_type->iface.alloc_buffer(buffer_type, size);
     ctx->base_ptr = (void *) 128;
@@ -349,6 +405,7 @@ static size_t ggml_backend_tp_get_max_size(ggml_backend_buffer_type_t buft) {
     auto wrapped_buft = ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[0])->iface;
     auto test = wrapped_buft.get_max_size(ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[0]));
     return test;
+    GGML_UNUSED(buft);
 }
 
 static size_t ggml_backend_tp_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -387,13 +444,12 @@ ggml_backend_buffer_type_t ggml_backend_tp_buffer_type(const char * endpoint) {
     // size_t alignment = get_alignment(sock);
     // size_t max_size = get_max_size(sock);
     ggml_backend_tp_buffer_type_context * buft_ctx = new ggml_backend_tp_buffer_type_context {
-        /* .endpoint  = */ endpoint,
-        /* .name      = */ "TP[" + std::string(endpoint) + "]",
+        /* .split = */ false,
     };
 
     ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
         /* .iface   = */ ggml_backend_tp_buffer_type_interface,
-        /* .device  = */ nullptr,
+        /* .device  = */ ggml_backend_tp_reg_get_device(ggml_backend_tp_reg(), 0),
         /* .context = */ buft_ctx
     };
     buft_map[endpoint] = buft;
@@ -416,19 +472,50 @@ static ggml_backend_buffer_type_t ggml_backend_tp_device_get_buffer_type(ggml_ba
     GGML_UNUSED(dev);
 }
 
+static bool is_split_compatible(ggml_op op) {
+    switch (op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_ADD:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_NONE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
+
+    // split buffers can only be used with GGML_OP_MUL_MAT and some other basic ops
+    if (!is_split_compatible(op->op)) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_tp_split(op->src[i]->buffer->buft)) {
+                return false;
+            }
+        }
+    }
 
     return ggml_parallel_devices[0]->iface.supports_op(ggml_parallel_devices[0], op);
 }
 
 static bool ggml_backend_tp_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    if (!buft || buft->iface.get_name != ggml_backend_tp_buffer_type_name) {
+    if (!buft) {
         return false;
     }
 
-    return true;
+    if (buft->iface.get_name == ggml_backend_tp_buffer_type_name) {
+        return true;
+    }
+
+    if (buft->iface.get_name == ggml_backend_tp_split_buffer_type_name) {
+        return true;
+    }
+
+    return false;
 
     GGML_UNUSED(dev);
 }
@@ -503,9 +590,38 @@ static bool ggml_backend_tp_set_backends(std::vector<ggml_backend_reg_t> & backe
     return true;
 }
 
+static ggml_backend_buffer_type_i ggml_backend_tp_split_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_tp_split_buffer_type_name,
+    /* .alloc_buffer     = */ ggml_backend_tp_buffer_type_interface.alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_tp_buffer_type_interface.get_alignment,
+    /* .get_max_size     = */ NULL,//ggml_backend_tp_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_tp_buffer_type_interface.get_alloc_size,
+    /* .is_host          = */ ggml_backend_tp_buffer_type_interface.is_host,
+};
+
+static ggml_backend_buffer_type_t ggml_tp_split_buffer_type(int main_device, const float * tensor_split) {
+    auto * ctx = new ggml_backend_tp_buffer_type_context {
+        /* .split = */ true,
+    };
+
+    static struct ggml_backend_buffer_type buft {
+        /* .iface   = */ ggml_backend_tp_split_buffer_type_interface,
+        /* .device  = */ ggml_backend_tp_reg_get_device(ggml_backend_tp_reg(), 0),
+        /* .context = */ ctx,
+    };
+
+    return &buft;
+
+    GGML_UNUSED(main_device);
+    GGML_UNUSED(tensor_split);
+}
+
 static void * ggml_backend_tp_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_tp_set_backends") == 0) {
         return (void *)ggml_backend_tp_set_backends;
+    }
+    if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
+        return (void *)ggml_tp_split_buffer_type;
     }
 
     return NULL;
