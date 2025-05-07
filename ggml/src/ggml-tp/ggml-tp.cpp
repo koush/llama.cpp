@@ -28,8 +28,9 @@ static ggml_guid_t ggml_backend_tp_guid() {
 struct ggml_backend_tp_context {
 };
 
+#define TP_MAX_DEVICES 16
 struct ggml_tensor_parallel_extra {
-    ggml_tensor * tensor;
+    ggml_tensor * tensors[TP_MAX_DEVICES];
     int tp_candidate;
 };
 
@@ -50,23 +51,29 @@ static void ggml_backend_tp_synchronize(ggml_backend_t backend) {
     // this is no-op because we don't have any async operations
 }
 
-static ggml_tensor * unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *, ggml_tensor *> & tensor_map) {
+static ggml_tensor** unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *, ggml_tensor **> & tensor_map) {
     auto found = tensor_map.find(tensor);
     if (found != tensor_map.end()) {
         return found->second;
     }
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
-    auto wrapped = extra->tensor;
-    tensor_map[tensor] = wrapped;
+    tensor_map[tensor] = extra->tensors;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (tensor->src[i] != nullptr) {
-            wrapped->src[i] = unwrap_tensor(tensor->src[i], tensor_map);
+        auto src = tensor->src[i];
+        if (!src) {
+            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                extra->tensors[j]->src[i] = nullptr;
+            }
+            continue;
         }
-        else {
-            wrapped->src[i] = nullptr;
+        auto wrapped_tensors = unwrap_tensor(src, tensor_map);
+        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+            auto wrapped = wrapped_tensors[j];
+            extra->tensors[j]->src[i] = wrapped;
         }
     }
-    return wrapped;
+
+    return extra->tensors;
 }
 
 static void map_tp_candidates(ggml_tensor *tensor, std::vector<ggml_tensor *> & check) {
@@ -103,8 +110,6 @@ static void map_tp_candidates(ggml_tensor *tensor, std::vector<ggml_tensor *> & 
 }
 
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    auto be = ggml_parallel_backends[0];
-
     std::vector<ggml_tensor *> check;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * tensor = cgraph->nodes[i];
@@ -119,19 +124,28 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         map_tp_candidates(tensor, check);
     }
 
-    std::map<ggml_tensor*, ggml_tensor*> tensor_map;
-    std::vector<ggml_tensor*> graph_nodes;
+    std::map<ggml_tensor*, ggml_tensor**> tensor_map;
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        graph_nodes.push_back(unwrap_tensor(cgraph->nodes[i], tensor_map));
+        unwrap_tensor(cgraph->nodes[i], tensor_map);
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_status status = be->iface.node_compute(be, graph_nodes[i]);
-        // printf("op %d: %s\n", i, ggml_op_name(graph_nodes[i]->op));
-        if (status != GGML_STATUS_SUCCESS) {
-            return status;
+        auto tensor = cgraph->nodes[i];
+        auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+            auto wrapped = extra->tensors[j];
+            if (!wrapped) {
+                continue;
+            }
+            auto be = ggml_parallel_backends[j];
+            ggml_status status = be->iface.node_compute(be, wrapped);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
         }
     }
-    ggml_backend_synchronize(be);
+    for (auto be : ggml_parallel_backends) {
+        ggml_backend_synchronize(be);
+    }
     return GGML_STATUS_SUCCESS;
 
     GGML_UNUSED(backend);
@@ -241,7 +255,7 @@ struct ggml_backend_tp_buffer_type_context {
 struct ggml_backend_tp_buffer_context {
     void * base_ptr;
     uint64_t remote_ptr;
-    ggml_backend_buffer_t wrapped;
+    ggml_backend_buffer_t backend_buffers[TP_MAX_DEVICES];
     bool split = false;
 };
 
@@ -270,87 +284,81 @@ static bool ggml_backend_buft_is_tp_split(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_tp_split_buffer_type_name;
 }
 
-static uint64_t max_ptr = 0;
-
 static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
-    // if (tensor->view_src != NULL) {
-    //     assert(tensor->view_src->buffer->buft == buffer->buft);
-    //     return GGML_STATUS_SUCCESS;
-    // }
-
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
+    ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra();
 
-    // struct ggml_init_params params {
-    //     /*.mem_size   =*/ ggml_tensor_overhead(),
-    //     /*.mem_buffer =*/ NULL,
-    //     /*.no_alloc   =*/ true,
-    // };
-    // ggml_context_ptr ctx_ptr { ggml_init(params) };
-    // GGML_ASSERT(ctx_ptr != nullptr);
-
-    // ggml_tensor * result = ggml_new_tensor_4d(ctx_ptr.get(), (ggml_type) tensor->type,
-    //     tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
-
-    ggml_tensor * wrapped = new ggml_tensor();
-    ggml_set_name(wrapped, tensor->name);
-    wrapped->type = (ggml_type) tensor->type;
-    wrapped->flags = tensor->flags;
-    wrapped->buffer = ctx->wrapped;
-
-    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
-        wrapped->ne[i] = tensor->ne[i];
-    }
-
-    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
-        wrapped->nb[i] = tensor->nb[i];
-    }
-
-    wrapped->op = (ggml_op) tensor->op;
-    for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
-        wrapped->op_params[i] = tensor->op_params[i];
-    }
-
-    if (!tensor->view_src) {
-        auto base = (char *) ctx->wrapped->iface.get_base(ctx->wrapped);
-        auto tensor_offset = (uint64_t) tensor->data - (uint64_t) 128;
-        wrapped->data = base + tensor_offset;
-        auto size = ctx->wrapped->buft->iface.get_alloc_size(ctx->wrapped->buft, tensor);
-        if ((uint64_t)wrapped->data + size > max_ptr) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor data pointer %p + size %zu exceeds max pointer %p\n",
-                wrapped->data, size, (void *)max_ptr);
-        }
-    }
-    else {
-        ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->view_src->extra;
-        auto view_src = extra->tensor;
-        wrapped->data = (char *) view_src->data + tensor->view_offs;
-        wrapped->view_src = view_src;
-        wrapped->view_offs = tensor->view_offs;
-        if (wrapped->view_src == NULL) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: view_src is NULL for tensor %s\n", tensor->name);
-            return GGML_STATUS_FAILED;
-        }
-    }
-
-    ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra {
-        /* .tensor = */ wrapped,
-        /* .tp_candidate = */ 0,
-    };
     tensor->extra = extra;
 
-    return ctx->wrapped->iface.init_tensor(ctx->wrapped, wrapped);
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        ggml_tensor * wrapped = new ggml_tensor();
+        ggml_set_name(wrapped, tensor->name);
+        wrapped->type = (ggml_type) tensor->type;
+        wrapped->flags = tensor->flags;
+        auto backend_buffer = ctx->backend_buffers[j];
+        wrapped->buffer = backend_buffer;
+
+        for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+            wrapped->ne[i] = tensor->ne[i];
+        }
+
+        for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+            wrapped->nb[i] = tensor->nb[i];
+        }
+
+        wrapped->op = (ggml_op) tensor->op;
+        for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
+            wrapped->op_params[i] = tensor->op_params[i];
+        }
+
+        if (!tensor->view_src) {
+            auto base = (char *) backend_buffer->iface.get_base(backend_buffer);
+            auto tensor_offset = (uint64_t) tensor->data - (uint64_t) 128;
+            wrapped->data = base + tensor_offset;
+            auto size = backend_buffer->buft->iface.get_alloc_size(backend_buffer->buft, tensor);
+        }
+        else {
+            ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->view_src->extra;
+            auto view_src = extra->tensors[j];
+            wrapped->data = (char *) view_src->data + tensor->view_offs;
+            wrapped->view_src = view_src;
+            wrapped->view_offs = tensor->view_offs;
+            if (wrapped->view_src == NULL) {
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: view_src is NULL for tensor %s\n", tensor->name);
+                return GGML_STATUS_FAILED;
+            }
+        }
+
+        extra->tensors[j] = wrapped;
+        auto result = backend_buffer->iface.init_tensor(backend_buffer, wrapped);
+        if (result != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: init_tensor failed for tensor %s\n", tensor->name);
+            return result;
+        }
+    }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_tp_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
-    ctx->wrapped->iface.set_tensor(ctx->wrapped, extra->tensor, data, offset, size);
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto wrapped = extra->tensors[j];
+        if (!wrapped) {
+            continue;
+        }
+        auto backend_buffer = ctx->backend_buffers[j];
+        backend_buffer->iface.set_tensor(backend_buffer, wrapped, data, offset, size);
+    }
 }
 
 static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
-    ctx->wrapped->iface.get_tensor(ctx->wrapped, extra->tensor, data, offset, size);
+    // TODO FIX UNSPLIT
+    auto backend_buffer = ctx->backend_buffers[0];
+    backend_buffer->iface.get_tensor(backend_buffer, extra->tensors[0], data, offset, size);
 
     GGML_UNUSED(ctx);
     GGML_UNUSED(tensor);
@@ -368,7 +376,10 @@ static bool ggml_backend_tp_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
 
 static void ggml_backend_tp_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
-    ctx->wrapped->iface.clear(ctx->wrapped, value);
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto backend_buffer = ctx->backend_buffers[j];
+        backend_buffer->iface.clear(backend_buffer, value);
+    }
     GGML_UNUSED(ctx);
     GGML_UNUSED(buffer);
     GGML_UNUSED(value);
@@ -389,10 +400,11 @@ static ggml_backend_buffer_i ggml_backend_tp_buffer_interface = {
 static ggml_backend_buffer_t ggml_backend_tp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_tp_buffer_context * ctx = new ggml_backend_tp_buffer_context();
     ctx->split = ggml_backend_buft_is_tp_split(buft);
-    auto buffer_type = ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[0]);
-    ctx->wrapped = buffer_type->iface.alloc_buffer(buffer_type, size);
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto buffer_type = ggml_parallel_devices[j]->iface.get_buffer_type(ggml_parallel_devices[j]);
+        ctx->backend_buffers[j] = buffer_type->iface.alloc_buffer(buffer_type, size);
+    }
     ctx->base_ptr = (void *) 128;
-    max_ptr = (uint64_t)ctx->wrapped->iface.get_base(ctx->wrapped) + size;
     return ggml_backend_buffer_init(buft, ggml_backend_tp_buffer_interface, ctx, size);
 }
 
