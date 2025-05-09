@@ -47,13 +47,22 @@ struct ggml_tensor_parallel_extra {
 
     ~ggml_tensor_parallel_extra() {
         for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
+            auto tensor = tensors[i];
+            if (tensor) {
+                delete tensor;
+                tensors[i] = nullptr;
+            }
+
             auto rejoined_tensor = rejoined_tensors[i];
             if (rejoined_tensor) {
                 delete rejoined_tensor;
+                rejoined_tensors[i] = nullptr;
             }
+
             auto rejoined_buft = rejoined_bufts[i];
             if (rejoined_buft) {
                 rejoined_buft->iface.free_buffer(rejoined_buft);
+                rejoined_bufts[i] = nullptr;
             }
         }
 
@@ -315,9 +324,11 @@ struct ggml_backend_tp_buffer_context {
     void * base_ptr;
     ggml_backend_buffer_t backend_buffers[TP_MAX_DEVICES];
     bool split = false;
-    std::map<void *, ggml_tensor_parallel_extra *> extras;
+    std::vector<ggml_tensor_parallel_extra *> extras;
 
     ~ggml_backend_tp_buffer_context() {
+        reset();
+
         for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
             auto backend_buffer = backend_buffers[i];
             if (backend_buffer) {
@@ -325,6 +336,22 @@ struct ggml_backend_tp_buffer_context {
                 backend_buffers[i] = nullptr;
             }
         }
+    }
+
+    void reset() {
+        for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
+            auto backend_buffer = backend_buffers[i];
+            if (backend_buffer) {
+                if (backend_buffer && backend_buffer->iface.reset) {
+                    backend_buffer->iface.reset(backend_buffer);
+                }
+            }
+        }
+
+        for (auto & extra : extras) {
+            delete extra;
+        }
+        extras.clear();
     }
 };
 
@@ -413,19 +440,11 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
     auto device_blocks = tensor_blocks / ggml_parallel_devices.size();
 
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
+
+    auto tensor_name = std::string(tensor->name);
     ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra();
-    // auto check = ctx->extras[tensor->data];
-    // if (!tensor->view_src) {
-    //     if (check) {
-    //         delete check;
-    //     }
-    //     ctx->extras[tensor->data] = extra;
-    // }
-    // else {
-    //     if (check) {
-    //         check->view_src_extras.push_back(extra);
-    //     }
-    // }
+    ctx->extras.push_back(extra);
+
     tensor->extra = extra;
 
     // according to ggml-cuda.h and from what i've seen, the weight matrices are transposed
@@ -513,7 +532,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 if (splits.split[j] == 0) {
                     GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: split tensor %s has zero size\n", tensor->name);
                     return GGML_STATUS_FAILED;
-                }                    // adjust the stride for the new row count
+                }
 
                 if (tensor->op != GGML_OP_NONE) {
                     // adjust the stride for the new row count
@@ -538,8 +557,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: split buffer type %s does not support views\n", buffer->buft->iface.get_name(buffer->buft));
                 return GGML_STATUS_FAILED;
             }
-            ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->view_src->extra;
-            auto view_src = extra->tensors[j];
+            auto view_src = ((ggml_tensor_parallel_extra *)tensor->view_src->extra)->tensors[j];
             if (tensor->view_offs % alignment) {
                 GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: view_offs %zu is not a multiple of parallel alignment %zu\n", tensor->view_offs, device_alignment);
                 return GGML_STATUS_FAILED;
@@ -664,9 +682,13 @@ static void ggml_backend_tp_buffer_clear(ggml_backend_buffer_t buffer, uint8_t v
         auto backend_buffer = ctx->backend_buffers[j];
         backend_buffer->iface.clear(backend_buffer, value);
     }
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(buffer);
     GGML_UNUSED(value);
+}
+
+static void ggml_backend_tp_buffer_reset(ggml_backend_buffer_t buffer) {
+    ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
+    ctx->reset();
+    GGML_UNUSED(buffer);
 }
 
 static ggml_backend_buffer_i ggml_backend_tp_buffer_interface = {
@@ -678,7 +700,7 @@ static ggml_backend_buffer_i ggml_backend_tp_buffer_interface = {
     /* .get_tensor      = */ ggml_backend_tp_buffer_get_tensor,
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_tp_buffer_clear,
-    /* .reset           = */ NULL,
+    /* .reset           = */ ggml_backend_tp_buffer_reset,
 };
 
 static ggml_backend_buffer_t ggml_backend_tp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
