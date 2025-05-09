@@ -875,9 +875,6 @@ static bool is_valid_op_and_buft(const ggml_tensor * op) {
         return true;
     }
 
-
-    return false;
-
     // a splitable weight must have multiple rows.
     if (op->ne[1] == 1) {
         return false;
