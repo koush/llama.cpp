@@ -85,10 +85,10 @@ static void ggml_backend_tp_synchronize(ggml_backend_t backend) {
     // this is no-op because we don't have any async operations
 }
 
-static ggml_tensor_parallel_extra * unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *, ggml_tensor_parallel_extra*> & tensor_map) {
+static void unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *, ggml_tensor_parallel_extra*> & tensor_map) {
     auto found = tensor_map.find(tensor);
     if (found != tensor_map.end()) {
-        return found->second;
+        return;
     }
 
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
@@ -97,27 +97,26 @@ static ggml_tensor_parallel_extra * unwrap_tensor(ggml_tensor * tensor, std::map
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         auto src = tensor->src[i];
         if (!src) {
-            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-                extra->tensors[j]->src[i] = nullptr;
-            }
             continue;
         }
+
+        unwrap_tensor(src, tensor_map);
         auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-        auto wrapped_tensor_extras = unwrap_tensor(src, tensor_map);
+
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+            auto wrapped = extra->tensors[j];
+
             if (!src_extra->split_tensors || extra->split_tensors) {
-                extra->tensors[j]->src[i] = wrapped_tensor_extras->tensors[j];
+                wrapped->src[i] = src_extra->tensors[j];
             }
             else {
                 if (!src_extra->needs_rejoin) {
                     GGML_LOG_ERROR("Tensor %s is not split, but its source %s is split\n", tensor->name, src->name);
                 }
-                extra->tensors[j]->src[i] = src_extra->rejoined_tensors[j];
+                wrapped->src[i] = src_extra->rejoined_tensors[j];
             }
         }
     }
-
-    return extra;
 }
 
 static const char * ggml_backend_tp_split_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -528,7 +527,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to device count %zu\n", tensor->name, alignment);
         return GGML_STATUS_FAILED;
     }
-    auto device_blocks = tensor_blocks / ggml_parallel_devices.size();
 
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
 
@@ -592,6 +590,12 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
         if (!tensor->view_src) {
             auto base = (char *) backend_buffer->iface.get_base(backend_buffer);
+
+            // the device block id is the same as tensor block id if not split (each device contains whole tensor)
+            // otherwise, the tensor block is divided amongst the devices.
+            // TODO: THIS IS WRONG, NEED TO NOT DIVIDE BY DEVICE COUNT, AND USE SPLITS VALUE
+            auto device_blocks = !split ? tensor_blocks : tensor_blocks / ggml_parallel_devices.size();
+
             auto device_base_offset = device_blocks * device_alignment;
             wrapped->data = base + device_base_offset;
 
