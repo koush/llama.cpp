@@ -725,18 +725,17 @@ static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
     ensure_rejoined(tensor);
     rejoin_tensor(tensor, extra, (char * )data);
 
-    auto recombined_size = ggml_nbytes(tensor);
     if (extra->split_tensors) {
         auto r = extra->rejoined_tensors[0];
         auto buft = r->buffer;
         // todo use async version
-        buft->iface.get_tensor(buft, r, data, offset, recombined_size);
+        buft->iface.get_tensor(buft, r, data, offset, size);
     }
     else {
         auto r = extra->tensors[0];
         auto buft = r->buffer;
         // todo use async version
-        buft->iface.get_tensor(buft, r, data, offset, recombined_size);
+        buft->iface.get_tensor(buft, r, data, offset, size);
     }
 
     GGML_UNUSED(buffer);
