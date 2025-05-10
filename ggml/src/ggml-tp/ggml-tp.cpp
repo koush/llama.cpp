@@ -15,7 +15,7 @@
 #include <numeric>
 
 
-#define GGML_BACKEND_TP_VALIDATE 0
+// #define GGML_BACKEND_TP_VALIDATE 1
 
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
 static std::vector<ggml_backend_t> ggml_parallel_backends;
@@ -50,7 +50,9 @@ struct ggml_tensor_parallel_extra {
     bool needs_rejoin;
     bool rejoined;
     ggml_backend_buffer_t rejoined_bufts[TP_MAX_DEVICES];
-    ggml_tensor * rejoined_tensors[TP_MAX_DEVICES];
+
+    // holds either split tensors or rejoined tensors depending on the owning tensor.
+    ggml_tensor * converted_tensors[TP_MAX_DEVICES];
 
     ~ggml_tensor_parallel_extra() {
         for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
@@ -60,10 +62,10 @@ struct ggml_tensor_parallel_extra {
                 tensors[i] = nullptr;
             }
 
-            auto rejoined_tensor = rejoined_tensors[i];
+            auto rejoined_tensor = converted_tensors[i];
             if (rejoined_tensor) {
                 delete rejoined_tensor;
-                rejoined_tensors[i] = nullptr;
+                converted_tensors[i] = nullptr;
             }
 
             auto rejoined_buft = rejoined_bufts[i];
@@ -114,13 +116,16 @@ static void unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *, ggml_ten
             auto wrapped = extra->tensors[j];
 
             if (!src_extra->split_tensors || extra->split_tensors) {
+                // if (tensor->op != GGML_OP_MUL_MAT) {
+                //     GGML_LOG_ERROR("Tensor %s is split, but its source %s is not split\n", tensor->name, src->name);
+                // }
                 wrapped->src[i] = src_extra->tensors[j];
             }
             else {
-                if (!src_extra->needs_rejoin) {
-                    GGML_LOG_ERROR("Tensor %s is not split, but its source %s is split\n", tensor->name, src->name);
-                }
-                wrapped->src[i] = src_extra->rejoined_tensors[j];
+                // if (!src_extra->needs_rejoin) {
+                //     GGML_LOG_ERROR("Tensor %s is not split, but its source %s is split\n", tensor->name, src->name);
+                // }
+                wrapped->src[i] = src_extra->converted_tensors[j];
             }
         }
     }
@@ -142,20 +147,26 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         if (src1->buffer && ggml_backend_buft_is_tp_split(src1->buffer->buft)) {
             return false;
         }
+        auto src1_extra = (ggml_tensor_parallel_extra * )src1->extra;
+        if (src1_extra && src1_extra->split_tensors) {
+            // todo add support for this.
+            return false;
+        }
 
         auto src0 = tensor->src[0];
         return ggml_backend_buft_is_tp_split(src0->buffer->buft);
     }
 
     return false;
+
     switch (op) {
-        case GGML_OP_UNARY:
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_ADD:
-        case GGML_OP_SUB:
+        // case GGML_OP_UNARY:
+        // case GGML_OP_MUL_MAT:
+        // case GGML_OP_ADD:
+        // case GGML_OP_SUB:
         case GGML_OP_MUL:
-        case GGML_OP_DIV:
-        case GGML_OP_NONE:
+        // case GGML_OP_DIV:
+        // case GGML_OP_NONE:
             return true;
         default:
             return false;
@@ -224,7 +235,7 @@ static size_t ggml_backend_tp_buffer_type_get_alignment(ggml_backend_buffer_type
 static ggml_status ensure_rejoined(const ggml_tensor * src) {
     auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
     if (!src_extra->split_tensors) {
-        // this tensor is not split, so we don't need to rejoin it
+        // this tensor is not split, so we can't rejoin it
         return GGML_STATUS_SUCCESS;
     }
 
@@ -250,7 +261,7 @@ static ggml_status ensure_rejoined(const ggml_tensor * src) {
         ggml_tensor * rejoined = ggml_backend_tp_clone_tensor(src);
         // since this is an input, rewrite the op.
         rejoined->op = GGML_OP_NONE;
-        src_extra->rejoined_tensors[j] = rejoined;
+        src_extra->converted_tensors[j] = rejoined;
 
         rejoined->buffer = buft;
         rejoined->data = base;
@@ -322,7 +333,7 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
     }
 
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        auto r = extra->rejoined_tensors[j];
+        auto r = extra->converted_tensors[j];
         auto buft = r->buffer;
         // todo use async version
         buft->iface.set_tensor(buft, r, data, 0, recombined_size);
@@ -381,19 +392,41 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         if (!extra->split_tensors || extra->needs_rejoin) {
             std::unique_ptr<char, decltype(&std::free)> t1(nullptr, &std::free);
             std::unique_ptr<char, decltype(&std::free)> t2(nullptr, &std::free);
+            
+            read_tensor(extra->tensors[0], t1);
+            read_tensor(extra->tensors[1], t2);
 
-            read_tensor(extra->needs_rejoin ? extra->rejoined_tensors[0] : extra->tensors[0], t1);
-            read_tensor(extra->needs_rejoin ? extra->rejoined_tensors[1] : extra->tensors[1], t2);
+            auto fail = false;
             auto r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(extra->tensors[0]));
-            if (r != -1) {
+            if (extra->split_tensors && r == -1) {
+                // split tensors should be different.
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
+                fail = true;
+            }
+            else if (!extra->split_tensors && r != -1) {
+                // non split tensors should be the same
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
+                fail = true;
+            }
+
+            if (extra->needs_rejoin) {
+                read_tensor(extra->needs_rejoin ? extra->converted_tensors[0] : extra->tensors[0], t1);
+                read_tensor(extra->needs_rejoin ? extra->converted_tensors[1] : extra->tensors[1], t2);
+                r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(extra->tensors[0]));
+                if (r != -1) {
+                    GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
+                    fail = true;
+                }
+            }
+            if (fail) {
                 GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
     
                 for (int i = 0; i < GGML_MAX_SRC; i++) {
                     auto src = tensor->src[i];
                     if (src) {
                         auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-                        read_tensor(src_extra->needs_rejoin ? src_extra->rejoined_tensors[0] : src_extra->tensors[0], t1);
-                        read_tensor(src_extra->needs_rejoin ? src_extra->rejoined_tensors[1] : src_extra->tensors[1], t2);
+                        read_tensor(src_extra->needs_rejoin ? src_extra->converted_tensors[0] : src_extra->tensors[0], t1);
+                        read_tensor(src_extra->needs_rejoin ? src_extra->converted_tensors[1] : src_extra->tensors[1], t2);
                         auto r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(src_extra->tensors[0]));
                         if (r != -1) {
                             GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
@@ -429,13 +462,16 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
                     rejoin_tensor(tensor, extra, recombined.get());
                 }
                 
-                read_tensor(extra->needs_rejoin ? extra->rejoined_tensors[0] : extra->tensors[0], t1);
-                read_tensor(extra->needs_rejoin ? extra->rejoined_tensors[1] : extra->tensors[1], t2);
+                read_tensor(extra->needs_rejoin ? extra->converted_tensors[0] : extra->tensors[0], t1);
+                read_tensor(extra->needs_rejoin ? extra->converted_tensors[1] : extra->tensors[1], t2);
                 r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(extra->tensors[0]));
                 if (r != -1) {
                     GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
                 }
             }
+        }
+        else {
+            printf("Tensor %s is not split\n", ggml_op_name(tensor->op));
         }
 #endif
     }
@@ -641,7 +677,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
 
-    auto tensor_name = std::string(tensor->name);
     ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra();
     ctx->extras.push_back(extra);
 
@@ -655,6 +690,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
     // this may be due to the weights themselves being split, or the tensor being a result of
     // a split compatible operation on a split src tensor.
     auto split = ctx->split;
+    auto split_from_src = false;
 
     // sanity check assertion. expecting weights to come in as GGML_OP_NONE
     // if (split && !is_split_compatible(tensor)) {
@@ -687,6 +723,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
             if (ggml_backend_buft_is_tp_split(src->buffer->buft) || src_extra->split_tensors) {
                 split = true;
+                split_from_src = true;
             }
         }
     }
@@ -720,7 +757,17 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                     return GGML_STATUS_FAILED;
                 }
 
-                if (tensor->op != GGML_OP_NONE) {
+                if (tensor->op == GGML_OP_NONE) {
+                    // these are weights which pretransposed and thus are split on rows
+                    wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[1] * splits.split[j];
+                    wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[1] * splits.split[j];
+
+                    // update row count
+                    wrapped->ne[1] = splits.split[j];
+                }
+                else {
+                    // everything else is split on columns from prior operations.
+
                     // adjust the stride for the new row count
                     wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
                     wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[0] * splits.split[j];
@@ -728,13 +775,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
                     // update col count
                     wrapped->ne[0] = splits.split[j];
-                }
-                else {
-                    wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[1] * splits.split[j];
-                    wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[1] * splits.split[j];
-
-                    // update row count
-                    wrapped->ne[1] = splits.split[j];
                 }
             }
         }
@@ -747,7 +787,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             auto view_src = view_src_extra->tensors[j];
             if (!tensor_is_split_compatible && view_src_extra->split_tensors) {
                 ensure_rejoined(tensor->view_src);
-                view_src = view_src_extra->rejoined_tensors[j];
+                view_src = view_src_extra->converted_tensors[j];
             }
             if (tensor->view_offs % alignment) {
                 GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: view_offs %zu is not a multiple of parallel alignment %zu\n", tensor->view_offs, device_alignment);
@@ -856,7 +896,7 @@ static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
 
     if (extra->split_tensors) {
         return;
-        auto r = extra->rejoined_tensors[0];
+        auto r = extra->converted_tensors[0];
         auto buft = r->buffer;
         // todo use async version
         buft->iface.get_tensor(buft, r, data, offset, size);
@@ -1005,10 +1045,6 @@ static ggml_backend_buffer_type_t ggml_backend_tp_device_get_buffer_type(ggml_ba
 static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
-
-    if (op->op == GGML_OP_RESHAPE) {
-        printf("ggml_backend_tp_device_supports_op: op %s is not supported\n", ggml_op_name(op->op));
-    }
 
     if (op->op != GGML_OP_MUL_MAT) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
