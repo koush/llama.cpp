@@ -15,6 +15,8 @@
 #include <numeric>
 
 
+#define GGML_BACKEND_TP_VALIDATE 0
+
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
 static std::vector<ggml_backend_t> ggml_parallel_backends;
 
@@ -36,8 +38,11 @@ struct ggml_tensor_parallel_extra {
     ggml_tensor * tensors[TP_MAX_DEVICES];
     // flag for whether the tensors are split
     bool split_tensors;
+
+#if GGML_BACKEND_TP_VALIDATE
     char *original_data;
     size_t original_size;
+#endif
 
     bool computed;
 
@@ -372,8 +377,8 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             ggml_backend_synchronize(be);
         }
 
-        if (false) {
-        //if (!extra->split_tensors || extra->needs_rejoin) {
+#if GGML_BACKEND_TP_VALIDATE
+        if (!extra->split_tensors || extra->needs_rejoin) {
             std::unique_ptr<char, decltype(&std::free)> t1(nullptr, &std::free);
             std::unique_ptr<char, decltype(&std::free)> t2(nullptr, &std::free);
 
@@ -432,6 +437,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
                 }
             }
         }
+#endif
     }
     
     for (auto be : ggml_parallel_backends) {
@@ -827,9 +833,11 @@ static void ggml_backend_tp_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
             cur_row += splits.split[j];
         }
 
+#if GGML_BACKEND_TP_VALIDATE
         extra->original_data = (char *)malloc(size);
         memcpy(extra->original_data, data, size);
         extra->original_size = size;
+#endif
     }
     else {
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
