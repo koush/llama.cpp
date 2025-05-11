@@ -168,9 +168,9 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_UNARY:
         case GGML_OP_MUL_MAT:
         // case GGML_OP_ADD:
-        // case GGML_OP_SUB:
+        case GGML_OP_SUB:
         case GGML_OP_MUL:
-        // case GGML_OP_DIV:
+        case GGML_OP_DIV:
         // case GGML_OP_NONE:
             return true;
         default:
@@ -243,7 +243,6 @@ static ggml_status ensure_split(const ggml_tensor *src) {
         // this tensor is already split, so we don't need to do anything
         return GGML_STATUS_SUCCESS;
     }
-
     if (src_extra->has_split) {
         return GGML_STATUS_SUCCESS;
     }
