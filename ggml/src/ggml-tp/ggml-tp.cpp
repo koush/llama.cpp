@@ -128,6 +128,18 @@ static void unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *, ggml_ten
                 // }
                 wrapped->src[i] = src_extra->converted_tensors[j];
             }
+            if (!wrapped->src[i]) {
+                GGML_LOG_ERROR("Tensor %s is not split, but its source %s is split\n", tensor->name, src->name);
+            }
+
+            // special case for matmul
+            if (i == 1 && tensor->op == GGML_OP_MUL_MAT) {
+                auto src1 = tensor->src[1];
+                auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
+                if (src1_extra->split_tensors) {
+                    wrapped->src[1] = src1_extra->converted_tensors[j];
+                }
+            }
         }
     }
 }
@@ -148,21 +160,16 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         if (src1->buffer && ggml_backend_buft_is_tp_split(src1->buffer->buft)) {
             return false;
         }
-        auto src1_extra = (ggml_tensor_parallel_extra * )src1->extra;
-        if (src1_extra && src1_extra->split_tensors) {
-            // todo add support for this.
-            return false;
-        }
-
         auto src0 = tensor->src[0];
         return ggml_backend_buft_is_tp_split(src0->buffer->buft);
     }
 
     switch (op) {
         case GGML_OP_UNARY:
+        case GGML_OP_MUL_MAT:
         // case GGML_OP_ADD:
         // case GGML_OP_SUB:
-        // case GGML_OP_MUL:
+        case GGML_OP_MUL:
         // case GGML_OP_DIV:
         // case GGML_OP_NONE:
             return true;
@@ -873,13 +880,18 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
         // everything but mul mat needs to be split as well.
         // mulmat can handle the broadcast "A" tensor.
-        if (split_from_src && tensor->op != GGML_OP_MUL_MAT && tensor->op != GGML_OP_UNARY) {
-            for (int i = 0; i < GGML_MAX_SRC; i++) {
-                auto src = tensor->src[i];
-                if (!src) {
-                    continue;
+        if (split_from_src) {
+            if (tensor->op == GGML_OP_MUL_MAT) {
+                ensure_rejoined(tensor->src[1]);
+            }
+            else if (tensor->op != GGML_OP_UNARY) {
+                for (int i = 0; i < GGML_MAX_SRC; i++) {
+                    auto src = tensor->src[i];
+                    if (!src) {
+                        continue;
+                    }
+                    ensure_split(src);
                 }
-                ensure_split(src);
             }
         }
     }
