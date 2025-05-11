@@ -183,7 +183,7 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-        // case GGML_OP_RESHAPE:
+        case GGML_OP_RESHAPE:
             return true;
         default:
             return false;
@@ -830,9 +830,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
     tensor->extra = extra;
 
-    // according to ggml-cuda.h and from what i've seen, the weight matrices are transposed
-    // for better memory layout, but the dst (this tensor) is not transposed.
-    ggml_split splits = tensor->op != GGML_OP_NONE ? get_col_splits(tensor) : get_row_splits(tensor);
     
     // determine whether this tensor op results in a split output.
     // this may be due to the weights themselves being split, or the tensor being a result of
@@ -913,6 +910,41 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
         auto device_alignment = ggml_backend_tp_buffer_type_get_alignment(backend_buffer->buft);
 
+        if (split) {
+            // when calculating splits on view tensors, need to get the original column partitioning
+            auto vs = tensor;
+            while (vs->view_src) {
+                vs = vs->view_src;
+            }
+
+            // according to ggml-cuda.h and from what i've seen, the weight matrices are transposed
+            // for better memory layout, but the dst (this tensor) is not transposed.
+            ggml_split splits = vs->op != GGML_OP_NONE ? get_col_splits(vs) : get_row_splits(vs);
+            
+            if (splits.split[j] == 0) {
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: split tensor %s has zero size\n", tensor->name);
+                return GGML_STATUS_FAILED;
+            }
+
+            if (tensor->op == GGML_OP_NONE) {
+                // these are weights which pretransposed and thus are split on rows
+                wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[1] * splits.split[j];
+                wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[1] * splits.split[j];
+
+                // update row count
+                wrapped->ne[1] = splits.split[j];
+            }
+            else {
+                // adjust the stride for the new row count
+                wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
+                wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[0] * splits.split[j];
+                wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[0] * splits.split[j];
+
+                // update col count
+                wrapped->ne[0] = splits.split[j];
+            }
+        }
+
         if (!tensor->view_src) {
             auto base = (char *) backend_buffer->iface.get_base(backend_buffer);
 
@@ -927,30 +959,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             auto device_base_offset = device_blocks * device_alignment;
             wrapped->data = base + device_base_offset;
 
-            if (split) {
-                if (splits.split[j] == 0) {
-                    GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: split tensor %s has zero size\n", tensor->name);
-                    return GGML_STATUS_FAILED;
-                }
-
-                if (tensor->op == GGML_OP_NONE) {
-                    // these are weights which pretransposed and thus are split on rows
-                    wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[1] * splits.split[j];
-                    wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[1] * splits.split[j];
-
-                    // update row count
-                    wrapped->ne[1] = splits.split[j];
-                }
-                else {
-                    // adjust the stride for the new row count
-                    wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
-                    wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[0] * splits.split[j];
-                    wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[0] * splits.split[j];
-
-                    // update col count
-                    wrapped->ne[0] = splits.split[j];
-                }
-            }
         }
         else {
             if (ctx->split) {
