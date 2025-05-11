@@ -116,20 +116,21 @@ static void unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *, ggml_ten
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
 
-            if (!src_extra->split_tensors || extra->split_tensors) {
-                // if (tensor->op != GGML_OP_MUL_MAT) {
-                //     GGML_LOG_ERROR("Tensor %s is split, but its source %s is not split\n", tensor->name, src->name);
-                // }
-                wrapped->src[i] = src_extra->tensors[j];
+            if (extra->split_tensors) {
+                if (src_extra->split_tensors) {
+                    wrapped->src[i] = src_extra->tensors[j];
+                }
+                else {
+                    wrapped->src[i] = src_extra->converted_tensors[j];
+                }
             }
             else {
-                // if (!src_extra->needs_rejoin) {
-                //     GGML_LOG_ERROR("Tensor %s is not split, but its source %s is split\n", tensor->name, src->name);
-                // }
-                wrapped->src[i] = src_extra->converted_tensors[j];
-            }
-            if (!wrapped->src[i]) {
-                GGML_LOG_ERROR("Tensor %s is not split, but its source %s is split\n", tensor->name, src->name);
+                if (src_extra->split_tensors) {
+                    wrapped->src[i] = src_extra->converted_tensors[j];
+                }
+                else {
+                    wrapped->src[i] = src_extra->tensors[j];
+                }
             }
 
             // special case for matmul
@@ -139,6 +140,13 @@ static void unwrap_tensor(ggml_tensor * tensor, std::map<ggml_tensor *, ggml_ten
                 if (src1_extra->split_tensors) {
                     wrapped->src[1] = src1_extra->converted_tensors[j];
                 }
+                else {
+                    wrapped->src[1] = src1_extra->tensors[j];
+                }
+            }
+
+            if (!wrapped->src[i]) {
+                GGML_LOG_ERROR("Tensor %s is not split, but its source %s is split\n", tensor->name, src->name);
             }
         }
     }
@@ -253,16 +261,19 @@ static ggml_status ensure_split(const ggml_tensor *src) {
 
     // unlike the matmult weight tensors which are rejoined column wise, when
     // splitting tensors for unary or arithmetic operations, split them row wise.
-    auto splits = get_row_splits(src);
+    auto splits = get_col_splits(src);
 
     size_t offset = 0;
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        auto split = splits.split[j];
-        auto wrapped = ggml_backend_tp_clone_tensor(src);
-        wrapped->buffer = src->buffer;
-        wrapped->data = (char *) src->data + offset;
+        auto split = ggml_backend_tp_clone_tensor(src);
+        split->op = GGML_OP_NONE;
+        src_extra->converted_tensors[j] = split;
+        
+        split->buffer = src_extra->tensors[j]->buffer;
+        split->data = (char *) src_extra->tensors[j] + offset;
+        split->ne[0] = splits.split[j];
 
-        offset += src->nb[1] * split;
+        offset += src->nb[1] * splits.split[j];
     }
 
 
