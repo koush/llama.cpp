@@ -46,7 +46,11 @@ struct ggml_tensor_parallel_extra {
 
     bool computed;
 
-    // in case the tensors are split and need to be rejoined, they are stored here.
+    // persist the split tensor memory layout for reshaped tensors
+    int64_t original_ne1;
+    size_t original_nb1;
+
+    // flags to maintain the rejoin/split state.
     bool has_rejoin;
     bool has_split;
     bool rejoined;
@@ -179,7 +183,7 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-        // case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
             return true;
         default:
             return false;
@@ -359,6 +363,9 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
         ggml_backend_synchronize(be);
     }
 
+    auto ne1 = extra->original_ne1 ? extra->original_ne1 : tensor->ne[1];
+    auto nb1 = extra->original_nb1 ? extra->original_nb1 : tensor->nb[1];
+
     // a tensor that is split across 4 devices can not be concatenated memorywise (rowwise).
     // rather, the tensors must be copied back in columnwise.
     // a 4x4 tensor with 4 GPU holding 4x1 tensors each:
@@ -366,9 +373,9 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
     // A B C D
     // A B C D
     // A B C D
-    for (int64_t row = 0; row < tensor->ne[1]; row++) {
+    for (int64_t row = 0; row < ne1; row++) {
         size_t offset = 0;
-        auto data_row_offset = data + row * tensor->nb[1];
+        auto data_row_offset = data + row * nb1;
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
             auto buft = wrapped->buffer;
@@ -879,6 +886,12 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             if (tensor->op == GGML_OP_MUL_MAT) {
                 ensure_rejoined(tensor->src[1]);
             }
+            else if (tensor->op == GGML_OP_RESHAPE) {
+                auto src0 = tensor->src[0];
+                auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
+                extra->original_ne1 = src0_extra->original_ne1 ? src0_extra->original_ne1 : src0->ne[1];
+                extra->original_nb1 = src0_extra->original_nb1 ? src0_extra->original_nb1 : src0->nb[1];
+            }
             else if (tensor->op != GGML_OP_UNARY) {
                 for (int i = 0; i < GGML_MAX_SRC; i++) {
                     auto src = tensor->src[i];
@@ -900,6 +913,31 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
         auto device_alignment = ggml_backend_tp_buffer_type_get_alignment(backend_buffer->buft);
 
+        if (split) {
+            if (splits.split[j] == 0) {
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: split tensor %s has zero size\n", tensor->name);
+                return GGML_STATUS_FAILED;
+            }
+
+            if (tensor->op == GGML_OP_NONE) {
+                // these are weights which pretransposed and thus are split on rows
+                wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[1] * splits.split[j];
+                wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[1] * splits.split[j];
+
+                // update row count
+                wrapped->ne[1] = splits.split[j];
+            }
+            else {
+                // adjust the stride for the new row count
+                wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
+                wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[0] * splits.split[j];
+                wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[0] * splits.split[j];
+
+                // update col count
+                wrapped->ne[0] = splits.split[j];
+            }
+        }
+
         if (!tensor->view_src) {
             auto base = (char *) backend_buffer->iface.get_base(backend_buffer);
 
@@ -913,31 +951,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
             auto device_base_offset = device_blocks * device_alignment;
             wrapped->data = base + device_base_offset;
-
-            if (split) {
-                if (splits.split[j] == 0) {
-                    GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: split tensor %s has zero size\n", tensor->name);
-                    return GGML_STATUS_FAILED;
-                }
-
-                if (tensor->op == GGML_OP_NONE) {
-                    // these are weights which pretransposed and thus are split on rows
-                    wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[1] * splits.split[j];
-                    wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[1] * splits.split[j];
-
-                    // update row count
-                    wrapped->ne[1] = splits.split[j];
-                }
-                else {
-                    // adjust the stride for the new row count
-                    wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
-                    wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[0] * splits.split[j];
-                    wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[0] * splits.split[j];
-
-                    // update col count
-                    wrapped->ne[0] = splits.split[j];
-                }
-            }
         }
         else {
             if (ctx->split) {
