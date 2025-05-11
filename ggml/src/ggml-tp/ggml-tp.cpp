@@ -160,7 +160,6 @@ static bool is_split_compatible(ggml_tensor * tensor) {
 
     switch (op) {
         case GGML_OP_UNARY:
-        // case GGML_OP_MUL_MAT:
         // case GGML_OP_ADD:
         // case GGML_OP_SUB:
         // case GGML_OP_MUL:
