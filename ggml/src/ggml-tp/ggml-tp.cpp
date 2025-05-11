@@ -13,9 +13,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <numeric>
-
+#include <set>
 
 // #define GGML_BACKEND_TP_VALIDATE 1
+#define NUM_DEVICES 1
 
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
 static std::vector<ggml_backend_t> ggml_parallel_backends;
@@ -184,6 +185,7 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_RESHAPE:
+        // case GGML_OP_CPY:
             return true;
         default:
             return false;
@@ -359,10 +361,6 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
     }
     extra->rejoined = true;
 
-    for (auto be : ggml_parallel_backends) {
-        ggml_backend_synchronize(be);
-    }
-
     auto ne1 = extra->original_ne1 ? extra->original_ne1 : tensor->ne[1];
     auto nb1 = extra->original_nb1 ? extra->original_nb1 : tensor->nb[1];
 
@@ -397,17 +395,29 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     std::map<ggml_tensor*, ggml_tensor_parallel_extra *> tensor_map;
 
+    std::set<ggml_tensor*> computed;
+    std::set<ggml_tensor*> need_sync;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         auto tensor = cgraph->nodes[i];
         ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
         // reset the rejoined state in case this tensor needs it.
         extra->rejoined = false;
-        extra->computed = false;
+        extra->computed = tensor->op == GGML_OP_NONE;
+        if (extra->computed) {
+            computed.insert(tensor);
+        }
 
         unwrap_tensor(tensor, tensor_map);
     }
 
     // auto recombines = 0;
+
+    // auto done = false;
+
+    // while (!done) {
+    //     done = true;
+    // }
 
     auto startTime = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -430,6 +440,10 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             auto recombined_size = ggml_nbytes(tensor);
             std::unique_ptr<char, decltype(&std::free)> recombined(
                 static_cast<char*>(std::malloc(recombined_size)), &std::free);
+
+            for (auto be : ggml_parallel_backends) {
+                ggml_backend_synchronize(be);
+            }
             rejoin_tensor(tensor, extra, recombined.get());
         }
 
@@ -911,30 +925,9 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         auto device_alignment = ggml_backend_tp_buffer_type_get_alignment(backend_buffer->buft);
 
         if (split) {
-            // when calculating splits on view tensors, need to get the original column partitioning
-            auto vs = tensor;
-            while (vs->view_src) {
-                vs = vs->view_src;
-            }
-
-            // according to ggml-cuda.h and from what i've seen, the weight matrices are transposed
-            // for better memory layout, but the dst (this tensor) is not transposed.
-            ggml_split splits = vs->op != GGML_OP_NONE ? get_col_splits(vs) : get_row_splits(vs);
-            
-            if (splits.split[j] == 0) {
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: split tensor %s has zero size\n", tensor->name);
-                return GGML_STATUS_FAILED;
-            }
-
-            if (tensor->op == GGML_OP_NONE) {
-                // these are weights which pretransposed and thus are split on rows
-                wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[1] * splits.split[j];
-                wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[1] * splits.split[j];
-
-                // update row count
-                wrapped->ne[1] = splits.split[j];
-            }
-            else {
+            if (tensor->op == GGML_OP_CPY) {
+                printf("Tensor %s is a copy\n", tensor->name);
+                ggml_split splits = get_col_splits(tensor);
                 // adjust the stride for the new row count
                 wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
                 wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[0] * splits.split[j];
@@ -943,6 +936,41 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 // update col count
                 wrapped->ne[0] = splits.split[j];
             }
+            else {
+                // when calculating splits on view tensors, need to get the original column partitioning
+                auto vs = tensor;
+                while (vs->view_src) {
+                    vs = vs->view_src;
+                }
+
+                // according to ggml-cuda.h and from what i've seen, the weight matrices are transposed
+                // for better memory layout, but the dst (this tensor) is not transposed.
+                ggml_split splits = vs->op != GGML_OP_NONE ? get_col_splits(vs) : get_row_splits(vs);
+                
+                if (splits.split[j] == 0) {
+                    GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: split tensor %s has zero size\n", tensor->name);
+                    return GGML_STATUS_FAILED;
+                }
+
+                if (tensor->op == GGML_OP_NONE) {
+                    // these are weights which pretransposed and thus are split on rows
+                    wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[1] * splits.split[j];
+                    wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[1] * splits.split[j];
+
+                    // update row count
+                    wrapped->ne[1] = splits.split[j];
+                }
+                else {
+                    // adjust the stride for the new row count
+                    wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
+                    wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[0] * splits.split[j];
+                    wrapped->nb[3] = wrapped->nb[3] / wrapped->ne[0] * splits.split[j];
+
+                    // update col count
+                    wrapped->ne[0] = splits.split[j];
+                }
+            }
+
         }
 
         if (!tensor->view_src) {
@@ -1073,6 +1101,10 @@ static void ggml_backend_tp_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
 static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
+    for (auto be : ggml_parallel_backends) {
+        ggml_backend_synchronize(be);
+    }
+
     ensure_rejoined(tensor);
     rejoin_tensor(tensor, extra, (char * )data);
 
@@ -1088,10 +1120,6 @@ static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
         auto buft = r->buffer;
         // todo use async version
         buft->iface.get_tensor(buft, r, data, offset, size);
-    }
-
-    for (auto be : ggml_parallel_backends) {
-        ggml_backend_synchronize(be);
     }
 
     GGML_UNUSED(buffer);
@@ -1310,8 +1338,6 @@ static const char * ggml_backend_tp_reg_get_name(ggml_backend_reg_t reg) {
 
     GGML_UNUSED(reg);
 }
-
-#define NUM_DEVICES 1
 
 static size_t ggml_backend_tp_reg_get_device_count(ggml_backend_reg_t reg) {
     return NUM_DEVICES;
