@@ -426,11 +426,6 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             rejoin_tensor(tensor, extra, recombined.get());
         }
 
-            
-        for (auto be : ggml_parallel_backends) {
-            ggml_backend_synchronize(be);
-        }
-
 #if GGML_BACKEND_TP_VALIDATE
         auto src0 = tensor->src[0];
         char* original_data = NULL;
@@ -624,10 +619,6 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             printf("Tensor %s is not split\n", ggml_op_name(tensor->op));
         }
 #endif
-    }
-    
-    for (auto be : ggml_parallel_backends) {
-        ggml_backend_synchronize(be);
     }
 
     auto endTime = std::chrono::high_resolution_clock::now();
@@ -1078,11 +1069,9 @@ static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
         buft->iface.get_tensor(buft, r, data, offset, size);
     }
 
-
     for (auto be : ggml_parallel_backends) {
         ggml_backend_synchronize(be);
     }
-
 
     GGML_UNUSED(buffer);
     GGML_UNUSED(tensor);
