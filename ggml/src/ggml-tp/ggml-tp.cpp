@@ -15,7 +15,7 @@
 #include <numeric>
 
 
-#define GGML_BACKEND_TP_VALIDATE 1
+// #define GGML_BACKEND_TP_VALIDATE 1
 
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
 static std::vector<ggml_backend_t> ggml_parallel_backends;
@@ -158,14 +158,12 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         return ggml_backend_buft_is_tp_split(src0->buffer->buft);
     }
 
-    return false;
-
     switch (op) {
-        // case GGML_OP_UNARY:
+        case GGML_OP_UNARY:
         // case GGML_OP_MUL_MAT:
         // case GGML_OP_ADD:
         // case GGML_OP_SUB:
-        case GGML_OP_MUL:
+        // case GGML_OP_MUL:
         // case GGML_OP_DIV:
         // case GGML_OP_NONE:
             return true;
@@ -832,7 +830,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
     // this may be due to the weights themselves being split, or the tensor being a result of
     // a split compatible operation on a split src tensor.
     auto split = ctx->split;
-    auto split_from_src = false;
 
     // sanity check assertion. expecting weights to come in as GGML_OP_NONE
     // if (split && !is_split_compatible(tensor)) {
@@ -849,7 +846,11 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 continue;
             }
             auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-            if (ggml_backend_buft_is_tp_split(src->buffer->buft) || src_extra->split_tensors) {
+            if (ggml_backend_buft_is_tp_split(src->buffer->buft)) {
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is split but src %s is not split compatible\n", tensor->name, src->name);
+                return GGML_STATUS_FAILED;
+            }
+            if (src_extra->split_tensors) {
                 if (ensure_rejoined(src) != GGML_STATUS_SUCCESS) {
                     return GGML_STATUS_FAILED;
                 }
@@ -857,6 +858,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         }
     }
     else if (!split) {
+        auto split_from_src = false;
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = tensor->src[i];
             if (!src) {
@@ -866,6 +868,19 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             if (ggml_backend_buft_is_tp_split(src->buffer->buft) || src_extra->split_tensors) {
                 split = true;
                 split_from_src = true;
+                break;
+            }
+        }
+
+        // everything but mul mat needs to be split as well.
+        // mulmat can handle the broadcast "A" tensor.
+        if (split_from_src && tensor->op != GGML_OP_MUL_MAT && tensor->op != GGML_OP_UNARY) {
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                auto src = tensor->src[i];
+                if (!src) {
+                    continue;
+                }
+                ensure_split(src);
             }
         }
     }
@@ -908,8 +923,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                     wrapped->ne[1] = splits.split[j];
                 }
                 else {
-                    // everything else is split on columns from prior operations.
-
                     // adjust the stride for the new row count
                     wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
                     wrapped->nb[2] = wrapped->nb[2] / wrapped->ne[0] * splits.split[j];
