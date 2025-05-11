@@ -175,7 +175,7 @@ static bool is_split_compatible(ggml_tensor * tensor) {
     switch (op) {
         case GGML_OP_UNARY:
         case GGML_OP_MUL_MAT:
-        // case GGML_OP_ADD:
+        case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -270,12 +270,14 @@ static ggml_status ensure_split(const ggml_tensor *src) {
         src_extra->converted_tensors[j] = split;
         
         split->buffer = src_extra->tensors[j]->buffer;
-        split->data = (char *) src_extra->tensors[j] + offset;
+        split->data = (char *) src_extra->tensors[j]->data + offset;
+
+        // note that only the dimension needs to be changed, retaining the stride allows
+        // using the original tensor data for the column split.
         split->ne[0] = splits.split[j];
 
-        offset += src->nb[1] * splits.split[j];
+        offset += src->nb[1] / src->ne[0] * splits.split[j];
     }
-
 
     return GGML_STATUS_SUCCESS;
 }
@@ -377,19 +379,11 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
         }
     }
 
-    for (auto be : ggml_parallel_backends) {
-        ggml_backend_synchronize(be);
-    }
-
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto r = extra->converted_tensors[j];
         auto buft = r->buffer;
         // todo use async version
         buft->iface.set_tensor(buft, r, data, 0, recombined_size);
-    }
-    
-    for (auto be : ggml_parallel_backends) {
-        ggml_backend_synchronize(be);
     }
 }
 
