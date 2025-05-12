@@ -40,7 +40,7 @@ using json = nlohmann::ordered_json;
 
 std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_LLAVA,
-    // TODO: add LLAMA_EXAMPLE_SERVER when it's ready
+    LLAMA_EXAMPLE_SERVER,
 };
 
 static std::string read_file(const std::string & fname) {
@@ -217,13 +217,11 @@ struct curl_slist_ptr {
 #define CURL_MAX_RETRY 3
 #define CURL_RETRY_DELAY_SECONDS 2
 
-static bool curl_perform_with_retry(const std::string & url, CURL * curl, int max_attempts, int retry_delay_seconds) {
+static bool curl_perform_with_retry(const std::string & url, CURL * curl, int max_attempts, int retry_delay_seconds, const char * method_name) {
     int remaining_attempts = max_attempts;
-    char * method = nullptr;
-    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_METHOD, &method);
 
     while (remaining_attempts > 0) {
-        LOG_INF("%s: %s %s (attempt %d of %d)...\n", __func__ , method, url.c_str(), max_attempts - remaining_attempts + 1, max_attempts);
+        LOG_INF("%s: %s %s (attempt %d of %d)...\n", __func__ , method_name, url.c_str(), max_attempts - remaining_attempts + 1, max_attempts);
 
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
@@ -287,13 +285,6 @@ static bool common_download_file_single(const std::string & url, const std::stri
             try {
                 metadata_in >> metadata;
                 LOG_DBG("%s: previous metadata file found %s: %s\n", __func__, metadata_path.c_str(), metadata.dump().c_str());
-                if (metadata.contains("url") && metadata.at("url").is_string()) {
-                    auto previous_url = metadata.at("url").get<std::string>();
-                    if (previous_url != url) {
-                        LOG_ERR("%s: Model URL mismatch: %s != %s\n", __func__, url.c_str(), previous_url.c_str());
-                        return false;
-                    }
-                }
                 if (metadata.contains("etag") && metadata.at("etag").is_string()) {
                     etag = metadata.at("etag");
                 }
@@ -301,10 +292,10 @@ static bool common_download_file_single(const std::string & url, const std::stri
                     last_modified = metadata.at("lastModified");
                 }
             } catch (const nlohmann::json::exception & e) {
-            LOG_ERR("%s: error reading metadata file %s: %s\n", __func__, metadata_path.c_str(), e.what());
-                return false;
+                LOG_ERR("%s: error reading metadata file %s: %s\n", __func__, metadata_path.c_str(), e.what());
             }
         }
+        // if we cannot open the metadata file, we assume that the downloaded file is not valid (etag and last-modified are left empty, so we will download it again)
     } else {
         LOG_INF("%s: no previous model file found %s\n", __func__, path.c_str());
     }
@@ -350,7 +341,7 @@ static bool common_download_file_single(const std::string & url, const std::stri
 
         // we only allow retrying once for HEAD requests
         // this is for the use case of using running offline (no internet), retrying can be annoying
-        bool was_perform_successful = curl_perform_with_retry(url, curl.get(), 1, 0);
+        bool was_perform_successful = curl_perform_with_retry(url, curl.get(), 1, 0, "HEAD");
         if (!was_perform_successful) {
             head_request_ok = false;
         }
@@ -432,7 +423,7 @@ static bool common_download_file_single(const std::string & url, const std::stri
         // start the download
         LOG_INF("%s: trying to download model from %s to %s (server_etag:%s, server_last_modified:%s)...\n", __func__,
             llama_download_hide_password_in_url(url).c_str(), path.c_str(), headers.etag.c_str(), headers.last_modified.c_str());
-        bool was_perform_successful = curl_perform_with_retry(url, curl.get(), CURL_MAX_RETRY, CURL_RETRY_DELAY_SECONDS);
+        bool was_perform_successful = curl_perform_with_retry(url, curl.get(), CURL_MAX_RETRY, CURL_RETRY_DELAY_SECONDS, "GET");
         if (!was_perform_successful) {
             return false;
         }
@@ -1292,7 +1283,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.use_color = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_INFILL, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
     add_opt(common_arg(
         {"-t", "--threads"}, "N",
         string_format("number of threads to use during generation (default: %d)", params.cpuparams.n_threads),
@@ -1425,7 +1416,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
-            ex == LLAMA_EXAMPLE_MAIN || ex == LLAMA_EXAMPLE_INFILL
+            ex == LLAMA_EXAMPLE_MAIN
                 ? "number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)"
                 : "number of tokens to predict (default: %d, -1 = infinity)",
             params.n_predict),
@@ -1664,7 +1655,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.input_prefix = value;
             params.enable_chat_template = false;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_INFILL}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(
         {"--in-suffix"}, "STRING",
         "string to suffix after user inputs with (default: empty)",
@@ -1672,7 +1663,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.input_suffix = value;
             params.enable_chat_template = false;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_INFILL}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(
         {"--no-warmup"},
         "skip warming up the model with an empty run",
@@ -1689,7 +1680,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.spm_infill = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_INFILL}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--samplers"}, "SAMPLERS",
         string_format("samplers that will be used for generation in the order, separated by \';\'\n(default: %s)", sampler_type_names.c_str()),
@@ -2107,13 +2098,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
-        {"--perplexity", "--all-logits"},
-        string_format("return logits for all tokens in the batch (default: %s)", params.logits_all ? "true" : "false"),
-        [](common_params & params) {
-            params.logits_all = true;
-        }
-    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
-    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
@@ -2220,32 +2204,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_NO_CONT_BATCHING"));
     add_opt(common_arg(
         {"--mmproj"}, "FILE",
-        "path to a multimodal projector file. see examples/llava/README.md",
+        "path to a multimodal projector file. see tools/mtmd/README.md\n"
+        "note: if -hf is used, this argument can be omitted",
         [](common_params & params, const std::string & value) {
             params.mmproj.path = value;
         }
-    ).set_examples(mmproj_examples));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ"));
     add_opt(common_arg(
         {"--mmproj-url"}, "URL",
-        "URL to a multimodal projector file. see examples/llava/README.md",
+        "URL to a multimodal projector file. see tools/mtmd/README.md",
         [](common_params & params, const std::string & value) {
             params.mmproj.url = value;
         }
-    ).set_examples(mmproj_examples));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_URL"));
     add_opt(common_arg(
         {"--no-mmproj"},
         "explicitly disable multimodal projector, useful when using -hf",
         [](common_params & params) {
             params.no_mmproj = true;
         }
-    ).set_examples(mmproj_examples));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_NO_MMPROJ"));
     add_opt(common_arg(
         {"--no-mmproj-offload"},
         "do not offload multimodal projector to GPU",
         [](common_params & params) {
             params.mmproj_use_gpu = false;
         }
-    ).set_examples(mmproj_examples));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_NO_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
         {"--image"}, "FILE",
         "path to an image file. use with multimodal models. Specify multiple times for batching",
@@ -2453,6 +2438,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--no-op-offload"},
+        string_format("disable offloading host tensor operations to device (default: %s)", params.no_op_offload ? "true" : "false"),
+        [](common_params & params) {
+            params.no_op_offload = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--lora"}, "FNAME",
         "path to LoRA adapter (can be repeated to use multiple adapters)",
         [](common_params & params, const std::string & value) {
@@ -2644,6 +2636,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--parse-special"},
+        string_format("prase special tokens (chat, tool, etc) (default: %s)", params.parse_special ? "true" : "false"),
+        [](common_params & params) {
+            params.parse_special = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"-pps"},
         string_format("is the prompt shared across parallel sequences (default: %s)", params.is_pp_shared ? "true" : "false"),
         [](common_params & params) {
@@ -2792,7 +2791,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_THREADS_HTTP"));
     add_opt(common_arg(
         {"--cache-reuse"}, "N",
-        string_format("min chunk size to attempt reusing from the cache via KV shifting (default: %d)", params.n_cache_reuse),
+        string_format(
+            "min chunk size to attempt reusing from the cache via KV shifting (default: %d)\n"
+            "[(card)](https://ggml.ai/f0.png)", params.n_cache_reuse
+        ),
         [](common_params & params, int value) {
             params.n_cache_reuse = value;
         }
@@ -2898,7 +2900,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.simple_io = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_INFILL}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(
         {"--positive-file"}, "FNAME",
         string_format("positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str()),
