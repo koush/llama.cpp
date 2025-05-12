@@ -855,20 +855,25 @@ static void ggml_backend_tp_get_tensor_async(ggml_backend_t backend, const ggml_
 }
 
 static bool ggml_backend_tp_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
-    if (src->buffer->buft != ggml_backend_tp_buffer_type()) {
-        return false;
-    }
     if (dst->buffer->buft != ggml_backend_tp_buffer_type()) {
         return false;
     }
-
-    auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
     auto dst_extra = (ggml_tensor_parallel_extra *)dst->extra;
-
     if (dst_extra->split_tensors) {
         GGML_LOG_WARN("Tensor %s is split, but set_tensor_async is called\n", dst->name);
         return false;
     }
+
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_tp_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
+        return true;
+    }
+
+    if (src->buffer->buft != ggml_backend_tp_buffer_type()) {
+        return false;
+    }
+
+    auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
 
     // validate that all the backends support some sort of copy
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
