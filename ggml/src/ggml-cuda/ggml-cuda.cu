@@ -2830,9 +2830,9 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
-    /* .node_compute            = */ ggml_backend_cuda_node_compute,
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
+    /* .node_compute            = */ ggml_backend_cuda_node_compute,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

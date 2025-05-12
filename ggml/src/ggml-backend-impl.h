@@ -109,14 +109,14 @@ extern "C" {
         // compute graph (always async if supported by the backend)
         enum ggml_status          (*graph_compute)     (ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
-        // compute node (always async if supported by the backend)
-        enum ggml_status          (*node_compute)     (ggml_backend_t backend, struct ggml_tensor *node);
-
         // (optional) event synchronization
         // record an event on this stream
         void (*event_record)(ggml_backend_t backend, ggml_backend_event_t event);
         // wait for an event on on a different stream
         void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
+
+        // compute node (always async if supported by the backend)
+        enum ggml_status          (*node_compute)     (ggml_backend_t backend, struct ggml_tensor *node);
     };
 
     struct ggml_backend {
