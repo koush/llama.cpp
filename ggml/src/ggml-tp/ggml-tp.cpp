@@ -97,7 +97,6 @@ static void ggml_backend_tp_free(ggml_backend_t backend) {
 
 static void ggml_backend_tp_synchronize(ggml_backend_t backend) {
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        auto dev = ggml_parallel_devices[j];
         auto backend = ggml_parallel_backends[j];
         if (backend->iface.synchronize) {
             backend->iface.synchronize(backend);
@@ -906,11 +905,9 @@ static bool ggml_backend_tp_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         auto wrapped_src = src_extra->tensors[j];
         auto wrapped_dst = dst_extra->tensors[j];
         auto be_src = ggml_parallel_backends[j];
-        auto be_dst = ggml_parallel_backends[j];
 
         if (!be_src->iface.cpy_tensor_async) {
             auto buft_src = wrapped_src->buffer;
-            auto buft_dst = wrapped_dst->buffer;
             if (!buft_src->iface.cpy_tensor(buft_src, wrapped_src, wrapped_dst)) {
                 GGML_LOG_WARN("Tensor %s cpy_tensor failed\n", src->name);
                 return false;
@@ -919,6 +916,8 @@ static bool ggml_backend_tp_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     }
 
     return true;
+
+    GGML_UNUSED(backend_src);
 }
 
 static ggml_backend_i ggml_backend_tp_interface = {
