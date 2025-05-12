@@ -51,16 +51,31 @@ struct ggml_tensor_parallel_extra {
     int64_t original_ne1;
     size_t original_nb1;
 
-    // flags to maintain the rejoin/split state.
+    // this tensor needs to be rejoined for another op.
     bool has_rejoin;
+    // this tensor needs to be split for another op.
     bool has_split;
+
+    // this tensor does not support split ops and has a src that needs to be rejoined.
+    bool needs_src_rejoin;
+
+    // this tensor has been rejoined already for this forward pass.
+    // this property is reset every forward pass.
     bool rejoined;
+    char * rejoined_buffer;
+    size_t rejoined_size;
+
     ggml_backend_buffer_t rejoined_bufts[TP_MAX_DEVICES];
 
     // holds either split tensors or rejoined tensors depending on the owning tensor.
     ggml_tensor * converted_tensors[TP_MAX_DEVICES];
 
     ~ggml_tensor_parallel_extra() {
+        if (rejoined_buffer) {
+            free(rejoined_buffer);
+            rejoined_buffer = nullptr;
+        }
+
         for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
             auto tensor = tensors[i];
             if (tensor) {
@@ -302,6 +317,11 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
         return GGML_STATUS_SUCCESS;
     }
 
+    auto reason_extra = (ggml_tensor_parallel_extra *)reason->extra;
+    if (!reason_extra->needs_src_rejoin) {
+        reason_extra->needs_src_rejoin = true;
+    }
+
     if (src_extra->has_rejoin) {
         return GGML_STATUS_SUCCESS;
     }
@@ -360,7 +380,7 @@ static void read_tensor(ggml_tensor *tensor, std::unique_ptr<char, decltype(&std
     buffer->iface.get_tensor(buffer, tensor, memory.get(), 0, tensor_size);
 }
 
-static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra * extra, char * data) {
+static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
     auto recombined_size = ggml_nbytes(tensor);
 
     if (!extra->split_tensors) {
@@ -372,8 +392,26 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
     }
     extra->rejoined = true;
 
+    // doesn't seem necessary?
+    // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+    //     auto be = ggml_parallel_backends[j];
+    //     if (be->iface.set_tensor_async) {
+    //         be->iface.synchronize(be);
+    //     }
+    // }
+
     auto ne1 = extra->original_ne1 ? extra->original_ne1 : tensor->ne[1];
     auto nb1 = extra->original_nb1 ? extra->original_nb1 : tensor->nb[1];
+
+    if (!extra->rejoined_buffer || extra->rejoined_size < recombined_size) {
+        if (extra->rejoined_buffer) {
+            free(extra->rejoined_buffer);
+            extra->rejoined_buffer = nullptr;
+        }
+        extra->rejoined_buffer = (char *) malloc(recombined_size);
+        extra->rejoined_size = recombined_size;
+    }
+    auto data = extra->rejoined_buffer;
 
     // a tensor that is split across 4 devices can not be concatenated memorywise (rowwise).
     // rather, the tensors must be copied back in columnwise.
@@ -444,9 +482,34 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     // printf("TP graph unwrap time: %lld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count());
     std::map<std::string, int64_t> total_rejoin_times;
 
+    auto late_rejoin = true;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         auto tensor = cgraph->nodes[i];
         auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+
+        if (late_rejoin && extra->needs_src_rejoin) {
+            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                auto be = ggml_parallel_backends[j];
+                if (!be->iface.get_tensor_async) {
+                    ggml_backend_synchronize(be);
+                }
+            }
+
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                auto src = tensor->src[j];
+                if (!src) {
+                    continue;
+                }
+                auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+                if (src_extra->has_rejoin) {
+                    auto startTime = std::chrono::high_resolution_clock::now();
+                    rejoin_tensor(src, src_extra);
+                    auto time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
+                    total_rejoin_times[ggml_op_name(tensor->op)] += time;
+                }
+            }
+        }
 
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
@@ -459,12 +522,8 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
 
         extra->computed = true;
 
-        // this split op needs to be recombined for the another op
-        if (extra->has_rejoin) {
-            auto recombined_size = ggml_nbytes(tensor);
-            std::unique_ptr<char, decltype(&std::free)> recombined(
-                static_cast<char*>(std::malloc(recombined_size)), &std::free);
-
+        // // this split op needs to be recombined for the another op
+        if (!late_rejoin && extra->has_rejoin) {
             for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
                 auto be = ggml_parallel_backends[j];
                 if (!be->iface.get_tensor_async) {
@@ -473,7 +532,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             }
 
             auto startTime = std::chrono::high_resolution_clock::now();
-            rejoin_tensor(tensor, extra, recombined.get());
+            rejoin_tensor(tensor, extra);
             auto time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
             total_rejoin_times[ggml_op_name(tensor->op)] += time;
         }
@@ -822,7 +881,7 @@ static void ggml_backend_tp_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
     ensure_rejoined(tensor, tensor);
-    rejoin_tensor(tensor, extra, (char * )data);
+    rejoin_tensor(tensor, extra);
 
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto be = ggml_parallel_backends[j];
@@ -1261,7 +1320,7 @@ static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
     }
 
     ensure_rejoined(tensor, tensor);
-    rejoin_tensor(tensor, extra, (char * )data);
+    rejoin_tensor(tensor, extra);
 
     if (extra->split_tensors) {
         // have never seen this called
