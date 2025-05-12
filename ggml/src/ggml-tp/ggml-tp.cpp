@@ -1246,10 +1246,12 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 return GGML_STATUS_FAILED;
             }
             auto tensor_blocks = tensor_base / alignment;
-            if (tensor_blocks % ggml_parallel_devices.size()) {
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to device count %zu\n", tensor->name, alignment);
-                return GGML_STATUS_FAILED;
-            }
+
+            // should be fine now, since uneven tensors are supported.
+            // if (tensor_blocks % ggml_parallel_devices.size()) {
+            //     GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to device count %zu\n", tensor->name, alignment);
+            //     return GGML_STATUS_FAILED;
+            // }
 
             auto base = (char *) backend_buffer->iface.get_base(backend_buffer);
 
