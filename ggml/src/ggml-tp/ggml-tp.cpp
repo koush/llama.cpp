@@ -300,7 +300,7 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     }
     src_extra->has_rejoin = true;
 
-    printf("Rejoining tensor for %s %d %d\n", ggml_op_name(reason->op), src->ne[0], src->ne[1]);
+    // printf("Rejoining tensor for %s %d %d\n", ggml_op_name(reason->op), src->ne[0], src->ne[1]);
 
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(src->buffer->buft);
 
@@ -378,19 +378,43 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
         auto data_row_offset = data + row * nb1;
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
-            auto buft = wrapped->buffer;
             auto wrapped_row_offset = wrapped->nb[1] * row;
-            // todo use async version
-            buft->iface.get_tensor(buft, wrapped, data_row_offset + offset, wrapped_row_offset, wrapped->nb[1]);
+            auto be = ggml_parallel_backends[j];
+            if (be->iface.get_tensor_async) {
+                be->iface.get_tensor_async(be, wrapped, data_row_offset + offset, wrapped_row_offset, wrapped->nb[1]);
+            }
+            else {
+                auto buft = wrapped->buffer;
+                buft->iface.get_tensor(buft, wrapped, data_row_offset + offset, wrapped_row_offset, wrapped->nb[1]);
+            }
             offset += wrapped->nb[1];
         }
     }
 
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto be = ggml_parallel_backends[j];
+        if (be->iface.set_tensor_async) {
+            be->iface.synchronize(be);
+        }
+    }
+
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto r = extra->converted_tensors[j];
-        auto buft = r->buffer;
-        // todo use async version
-        buft->iface.set_tensor(buft, r, data, 0, recombined_size);
+        auto be = ggml_parallel_backends[j];
+        if (be->iface.set_tensor_async) {
+            be->iface.set_tensor_async(be, r, data, 0, recombined_size);
+        }
+        else {
+            auto buft = r->buffer;
+            buft->iface.set_tensor(buft, r, data, 0, recombined_size);
+        }
+    }
+
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto be = ggml_parallel_backends[j];
+        if (be->iface.set_tensor_async) {
+            be->iface.synchronize(be);
+        }
     }
 }
 
@@ -437,9 +461,13 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             std::unique_ptr<char, decltype(&std::free)> recombined(
                 static_cast<char*>(std::malloc(recombined_size)), &std::free);
 
-            for (auto be : ggml_parallel_backends) {
-                ggml_backend_synchronize(be);
+            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                auto be = ggml_parallel_backends[j];
+                if (!be->iface.get_tensor_async) {
+                    ggml_backend_synchronize(be);
+                }
             }
+
             rejoin_tensor(tensor, extra, recombined.get());
         }
 
@@ -1094,8 +1122,11 @@ static void ggml_backend_tp_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
 static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
-    for (auto be : ggml_parallel_backends) {
-        ggml_backend_synchronize(be);
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto be = ggml_parallel_backends[j];
+        if (!be->iface.get_tensor_async) {
+            ggml_backend_synchronize(be);
+        }
     }
 
     ensure_rejoined(tensor, tensor);
