@@ -288,7 +288,7 @@ static ggml_status ensure_split(const ggml_tensor *src) {
     return GGML_STATUS_SUCCESS;
 }
 
-static ggml_status ensure_rejoined(const ggml_tensor * src) {
+static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) {
     auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
     if (!src_extra->split_tensors) {
         // this tensor is not split, so we can't rejoin it
@@ -299,6 +299,8 @@ static ggml_status ensure_rejoined(const ggml_tensor * src) {
         return GGML_STATUS_SUCCESS;
     }
     src_extra->has_rejoin = true;
+
+    printf("Rejoining tensor for %s %d %d\n", ggml_op_name(reason->op), src->ne[0], src->ne[1]);
 
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(src->buffer->buft);
 
@@ -395,19 +397,13 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     std::map<ggml_tensor*, ggml_tensor_parallel_extra *> tensor_map;
 
-    std::set<ggml_tensor*> computed;
-    std::set<ggml_tensor*> need_sync;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         auto tensor = cgraph->nodes[i];
         ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
         // reset the rejoined state in case this tensor needs it.
         extra->rejoined = false;
-        extra->computed = tensor->op == GGML_OP_NONE;
-        if (extra->computed) {
-            computed.insert(tensor);
-        }
-
+        extra->computed = false;
         unwrap_tensor(tensor, tensor_map);
     }
 
@@ -869,10 +865,8 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is split but src %s is not split compatible\n", tensor->name, src->name);
                 return GGML_STATUS_FAILED;
             }
-            if (src_extra->split_tensors) {
-                if (ensure_rejoined(src) != GGML_STATUS_SUCCESS) {
-                    return GGML_STATUS_FAILED;
-                }
+            if (ensure_rejoined(tensor, src) != GGML_STATUS_SUCCESS) {
+                return GGML_STATUS_FAILED;
             }
         }
     }
@@ -895,7 +889,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         // mulmat can handle the broadcast "A" tensor.
         if (split_from_src) {
             if (tensor->op == GGML_OP_MUL_MAT) {
-                ensure_rejoined(tensor->src[1]);
+                ensure_rejoined(tensor, tensor->src[1]);
             }
             else if (tensor->op == GGML_OP_RESHAPE) {
                 auto src0 = tensor->src[0];
@@ -926,7 +920,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
         if (split) {
             if (tensor->op == GGML_OP_CPY) {
-                printf("Tensor %s is a copy\n", tensor->name);
                 ggml_split splits = get_col_splits(tensor);
                 // adjust the stride for the new row count
                 wrapped->nb[1] = wrapped->nb[1] / wrapped->ne[0] * splits.split[j];
@@ -996,7 +989,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             auto view_src_extra = (ggml_tensor_parallel_extra *)tensor->view_src->extra;
             auto view_src = view_src_extra->tensors[j];
             if (!tensor_is_split_compatible && view_src_extra->split_tensors) {
-                ensure_rejoined(tensor->view_src);
+                ensure_rejoined(tensor, tensor->view_src);
                 view_src = view_src_extra->converted_tensors[j];
             }
             if (tensor->view_offs % alignment) {
@@ -1105,7 +1098,7 @@ static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
         ggml_backend_synchronize(be);
     }
 
-    ensure_rejoined(tensor);
+    ensure_rejoined(tensor, tensor);
     rejoin_tensor(tensor, extra, (char * )data);
 
     if (extra->split_tensors) {
