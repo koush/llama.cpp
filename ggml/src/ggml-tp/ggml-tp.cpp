@@ -96,7 +96,7 @@ static void ggml_backend_tp_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_tp_synchronize(ggml_backend_t backend) {
-    for (int j = 0; j < ggml_parallel_devices.size(); j++) {
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto dev = ggml_parallel_devices[j];
         auto backend = ggml_parallel_backends[j];
         if (backend->iface.synchronize) {
@@ -1047,19 +1047,6 @@ static ggml_split get_alloc_splits(size_t size) {
 
 static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(buffer->buft);
-    // the virtual address of the buffer starts at the alignment value, so subtract that.
-    auto tensor_base = (uint64_t) tensor->data - alignment;
-    // tensor data is expected to be aligned.
-    if (tensor_base % alignment) {
-        GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to %zu\n", tensor->name, alignment);
-        return GGML_STATUS_FAILED;
-    }
-    auto tensor_blocks = tensor_base / alignment;
-    if (tensor_blocks % ggml_parallel_devices.size()) {
-        GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to device count %zu\n", tensor->name, alignment);
-        return GGML_STATUS_FAILED;
-    }
-
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
 
     ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra();
@@ -1193,6 +1180,19 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         }
 
         if (!tensor->view_src) {
+            // the virtual address of the buffer starts at the alignment value, so subtract that.
+            auto tensor_base = (uint64_t) tensor->data - alignment;
+            // tensor data is expected to be aligned.
+            if (tensor_base % alignment) {
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to %zu\n", tensor->name, alignment);
+                return GGML_STATUS_FAILED;
+            }
+            auto tensor_blocks = tensor_base / alignment;
+            if (tensor_blocks % ggml_parallel_devices.size()) {
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to device count %zu\n", tensor->name, alignment);
+                return GGML_STATUS_FAILED;
+            }
+
             auto base = (char *) backend_buffer->iface.get_base(backend_buffer);
 
             size_t device_blocks;
@@ -1218,12 +1218,8 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 ensure_rejoined(tensor, tensor->view_src);
                 view_src = view_src_extra->converted_tensors[j];
             }
-            if (tensor->view_offs % alignment) {
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: view_offs %zu is not a multiple of parallel alignment %zu\n", tensor->view_offs, device_alignment);
-                return GGML_STATUS_FAILED;
-            }
-            // the view on this tensor must be adjusted to the device's alignment for heterogenous devices that may have different alignments
-            auto view_offs = tensor->view_offs / alignment * device_alignment;
+            auto rem = tensor->view_offs % alignment;
+            auto view_offs = tensor->view_offs / alignment * device_alignment + rem;
             wrapped->data = (char *) view_src->data + view_offs;
             wrapped->view_src = view_src;
             wrapped->view_offs = view_offs;
