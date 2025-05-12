@@ -13,7 +13,7 @@ extern "C" {
 GGML_BACKEND_API ggml_backend_t ggml_backend_tp_init(const char * endpoint);
 GGML_BACKEND_API bool ggml_backend_is_tp(ggml_backend_t backend);
 
-GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_tp_buffer_type(const char * endpoint);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_tp_buffer_type();
 
 GGML_BACKEND_API void ggml_backend_tp_get_device_memory(const char * endpoint, size_t * free, size_t * total);
 
