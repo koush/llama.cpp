@@ -356,6 +356,12 @@ struct ggml_backend_tp_buffer_context {
                 backend_buffer->iface.free_buffer(backend_buffer);
                 backend_buffers[i] = nullptr;
             }
+
+            auto rejoined_buft = rejoined_bufts[i];
+            if (rejoined_buft) {
+                rejoined_buft->iface.free_buffer(rejoined_buft);
+                rejoined_bufts[i] = nullptr;
+            }
         }
     }
 
@@ -369,13 +375,6 @@ struct ggml_backend_tp_buffer_context {
             }
 
             rejoined_buft_sizes[i] = 0;
-
-            // this could possibly be destructor only
-            auto rejoined_buft = rejoined_bufts[i];
-            if (rejoined_buft) {
-                rejoined_buft->iface.free_buffer(rejoined_buft);
-                rejoined_bufts[i] = nullptr;
-            }
         }
 
         for (auto & extra : extras) {
