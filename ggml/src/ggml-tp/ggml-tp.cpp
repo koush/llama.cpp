@@ -629,8 +629,14 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto rejoined = extra->converted_tensors[j];
                 
-            rejoined->buffer = ctx->rejoined_bufts[j];
-            rejoined->data = (char *)ctx->rejoined_bufts[j]->iface.get_base(ctx->rejoined_bufts[j]) + extra->rejoined_buft_offsets[j];
+            auto buft = ctx->rejoined_bufts[j];
+            rejoined->buffer = buft;
+            rejoined->data = (char *)buft->iface.get_base(buft) + extra->rejoined_buft_offsets[j];
+
+            auto result = buft->iface.init_tensor(buft, rejoined);
+            if (result != GGML_STATUS_SUCCESS) {
+                return result;
+            }
         }
     }
 
