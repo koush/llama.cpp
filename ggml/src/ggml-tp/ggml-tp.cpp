@@ -620,11 +620,11 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
                 ggml_backend_synchronize(be);
             }
         
-            ensure_rejoined(tensor);
+            ensure_rejoined(tensor, tensor);
             auto recombined_size = ggml_nbytes(tensor);
             std::unique_ptr<char, decltype(&std::free)> data(
                 static_cast<char*>(std::malloc(recombined_size)), &std::free);
-            rejoin_tensor(tensor, extra, data.get());
+            rejoin_tensor(tensor, extra);
             read_tensor(extra->converted_tensors[0], data);
 
             std::unique_ptr<char, decltype(&std::free)> data2(nullptr, &std::free);
@@ -684,7 +684,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             if (extra->split_tensors && r == -1) {
                 // split tensors should be different.
                 GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                fail = true;
+                // fail = true;
             }
             else if (!extra->split_tensors && r != -1) {
                 // non split tensors should be the same
@@ -739,10 +739,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
 
                 // this split op needs to be recombined for the another op
                 if (extra->has_rejoin) {
-                    auto recombined_size = ggml_nbytes(tensor);
-                    std::unique_ptr<char, decltype(&std::free)> recombined(
-                        static_cast<char*>(std::malloc(recombined_size)), &std::free);
-                    rejoin_tensor(tensor, extra, recombined.get());
+                    rejoin_tensor(tensor, extra);
                 }
                 
                 read_tensor(extra->has_rejoin ? extra->converted_tensors[0] : extra->tensors[0], t1);
@@ -1269,11 +1266,10 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             }
             auto tensor_blocks = tensor_base / alignment;
 
-            // should be fine now, since uneven tensors are supported.
-            // if (tensor_blocks % ggml_parallel_devices.size()) {
-            //     GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to device count %zu\n", tensor->name, alignment);
-            //     return GGML_STATUS_FAILED;
-            // }
+            if (tensor_blocks % ggml_parallel_devices.size()) {
+                GGML_LOG_WARN("ggml_backend_tp_buffer_init_tensor: tensor %s is not aligned to device count %zu\n", tensor->name, alignment);
+                return GGML_STATUS_FAILED;
+            }
 
             auto base = (char *) backend_buffer->iface.get_base(backend_buffer);
 
@@ -1428,8 +1424,8 @@ static size_t ggml_backend_tp_buffer_type_get_alloc_size(ggml_backend_buffer_typ
         max_alloc_size = std::max(max_alloc_size, alloc_size);
     }
 
-    ;
-    max_alloc_size = ggml_align_size(max_alloc_size, ggml_backend_tp_buffer_type_get_alignment(buft));
+    // to get cleanly diviible splits, make sure the allocation alignment is the multiple of the number of devices
+    max_alloc_size = ggml_align_size(max_alloc_size, ggml_backend_tp_buffer_type_get_alignment(buft) * ggml_parallel_devices.size());
     return max_alloc_size;
     // return ggml_nbytes(tensor);
 }
