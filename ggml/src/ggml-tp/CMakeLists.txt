@@ -2,6 +2,7 @@ message(STATUS "Using Tensor Parallel backend")
 
 ggml_add_backend_library(ggml-tp
                          ggml-tp.cpp
+                         ggml-tp-threadpool.cpp
                         )
 
 if (WIN32)
