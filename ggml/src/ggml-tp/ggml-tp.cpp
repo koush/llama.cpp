@@ -76,6 +76,10 @@ struct ggml_tensor_parallel_extra {
     // holds either split tensors or rejoined tensors depending on the owning tensor.
     ggml_tensor * converted_tensors[TP_MAX_DEVICES];
 
+    // when a tensor is rejoined, it gathers the data from all the devices.
+    // each device will provide a view of their full data for other devices as copy destinations.
+    ggml_tensor * rejoined_tensor_views[TP_MAX_DEVICES][TP_MAX_DEVICES];
+
     ~ggml_tensor_parallel_extra() {
         if (rejoined_buffer) {
             free(rejoined_buffer);
@@ -84,15 +88,30 @@ struct ggml_tensor_parallel_extra {
 
         for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
             auto tensor = tensors[i];
-            if (tensor) {
-                delete tensor;
-                tensors[i] = nullptr;
+            if (!tensor) {
+                break;
             }
+            delete tensor;
+            tensors[i] = nullptr;
+    }
 
+        for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
             auto rejoined_tensor = converted_tensors[i];
-            if (rejoined_tensor) {
-                delete rejoined_tensor;
-                converted_tensors[i] = nullptr;
+            if (!rejoined_tensor) {
+                break;
+            }
+            delete rejoined_tensor;
+            converted_tensors[i] = nullptr;
+        }
+
+        for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
+            for (int j = 0; j < TP_MAX_DEVICES; j++) {
+                auto rejoined_tensor_view = rejoined_tensor_views[i][j];
+                if (!rejoined_tensor_view) {
+                    break;
+                }
+                delete rejoined_tensor_view;
+                rejoined_tensor_views[i][j] = nullptr;
             }
         }
     }
@@ -444,11 +463,32 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
 
         // since this is an input, rewrite the op.
         rejoined->op = GGML_OP_NONE;
+    }
 
-        // auto result = buft->iface.init_tensor(buft, rejoined);
-        // if (result != GGML_STATUS_SUCCESS) {
-        //     return result;
-        // }
+    auto splits = get_col_splits(src);
+
+    // a tensor that is split across 4 devices can not be concatenated memorywise (rowwise).
+    // rather, the tensors must be copied back in columnwise.
+    // a 4x4 tensor with 4 GPU holding 4x2 tensors each:
+    // A A B B C C D D
+    // A A B B C C D D
+    // A A B B C C D D
+    // A A B B C C D D
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto rejoined = src_extra->converted_tensors[j];
+
+        size_t col_offset = 0;
+        for (int i = 0; i < ggml_parallel_devices.size(); i++) {
+            auto view = ggml_backend_tp_clone_tensor(rejoined);
+            src_extra->rejoined_tensor_views[j][i] = view;
+
+            view->view_src = rejoined;
+            view->ne[0] = splits.split[i];
+            // adjust the offset to the start of the column in the destination tensor
+            view->view_offs = rejoined->nb[1] / rejoined->ne[0] * col_offset;
+
+            col_offset += splits.split[j];
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -625,7 +665,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             contexts.insert(ctx);
             ctx->allocate_rejoin_buffers();
         }
-        
+
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto rejoined = extra->converted_tensors[j];
                 
@@ -637,11 +677,21 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             if (result != GGML_STATUS_SUCCESS) {
                 return result;
             }
+
+            for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
+                auto rejoined_tensor_view = extra->rejoined_tensor_views[j][i];
+                if (!rejoined_tensor_view) {
+                    break;
+                }
+                rejoined_tensor_view->buffer = buft;
+                rejoined_tensor_view->data = rejoined->data + rejoined_tensor_view->view_offs;
+                rejoined_tensor_view->view_src = rejoined;
+                rejoined_tensor_view->view_offs = extra->rejoined_buft_offsets[j];
+            }
         }
     }
 
     std::map<std::string, int64_t> total_rejoin_times;
-
 
     int start = 0;
     while (start < cgraph->n_nodes) {
