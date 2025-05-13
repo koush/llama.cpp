@@ -21,7 +21,7 @@
 
 // #define GGML_BACKEND_TP_VALIDATE 1
 #define NUM_DEVICES 1
-// #define GGML_BACKEND_TP_TENSOR_CPY
+#define GGML_BACKEND_TP_TENSOR_CPY
 
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
 static std::vector<ggml_backend_t> ggml_parallel_backends;
@@ -605,16 +605,25 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
 typedef struct compute_thread {
     int device_index;
     struct ggml_cgraph * cgraph;
-    int start;
     int end;
-    std::mutex mutex;
+    ggml_backend_tp_semaphore semaphore;
+    std::vector<struct compute_thread *> * peers;
+    std::mutex done;
 } compute_thread;
 
+static void release_peers(struct compute_thread * thread) {
+    for (int i = 0; i < thread->peers->size(); i++) {
+        auto t = thread->peers->at(i);
+        ggml_backend_tp_semaphore_release(&t->semaphore, 1);
+    }
+}
+
 static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thread) {
+    auto startTime = std::chrono::high_resolution_clock::now();
+
     auto cgraph = thread->cgraph;
     auto device_index = thread->device_index;
-    auto start = thread->start;
-    for (int node_index = start; node_index < cgraph->n_nodes; node_index++) {
+    for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
         auto tensor = cgraph->nodes[node_index];
         auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
@@ -623,7 +632,8 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         ggml_status status = be->iface.node_compute(be, wrapped);
         if (status != GGML_STATUS_SUCCESS) {
             thread->end = status;
-            thread->mutex.unlock();
+            release_peers(thread);
+            thread->done.unlock();
             return;
         }
 
@@ -667,16 +677,33 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             }
 #endif
             thread->end = node_index;
-            thread->mutex.unlock();
-            return;
+            release_peers(thread);
+
+            // wait for everyone else
+            for (size_t i = 0; i < thread->peers->size(); i++) {
+                ggml_backend_tp_semaphore_acquire(&thread->semaphore);
+            }
+
+            #ifndef GGML_BACKEND_TP_TENSOR_CPY
+            if (device_index == 0) {
+                rejoin_tensor(tensor, extra);
+                release_peers(thread);
+            }
+
+            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
+            #endif
         }
     }
+
     thread->end = cgraph->n_nodes;
-    thread->mutex.unlock();
+    release_peers(thread);
+    thread->done.unlock();
+
+    // printf("TP graph %d compute time: %ld us\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count());
 }
 
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    static auto lastStartTime = std::chrono::high_resolution_clock::now();
+    auto lastStartTime = std::chrono::high_resolution_clock::now();
 
     std::set<ggml_tensor*> tensors;
 
@@ -742,69 +769,36 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
 
     std::map<std::string, int64_t> total_rejoin_times;
 
-    int start = 0;
-    while (start < cgraph->n_nodes) {
-        int i;
-
-        std::vector<struct compute_thread *> threads;
-        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-            auto thread = new compute_thread();
-            thread->device_index = j;
-            thread->cgraph = cgraph;
-            thread->start = start;
-            thread->end = cgraph->n_nodes;
-            thread->mutex.lock();
-            threads.push_back(thread);
-            // launch it
-            ggml_backend_tp_threadpool_enqueue(&ggml_device_threadpool, (thread_task_func)ggml_backend_tp_buffer_graph_compute_one, thread);
-        }
-
-        while (!threads.empty()) {
-            auto thread = threads.back();
-            threads.pop_back();
-            thread->mutex.lock();
-            i = thread->end;
-            delete thread;
-            if (i < 0) {
-                return (ggml_status)i;
-            }
-        }
-
-        if (i == cgraph->n_nodes) {
-            break;
-        }
-
-        auto tensor = cgraph->nodes[i];
-        auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
-
-        // this split op needs to be recombined for the another op
-        if (!extra->has_rejoin) {
-            GGML_LOG_ERROR("Expected rejoin for tensor %s\n", tensor->name);
-            return GGML_STATUS_FAILED;
-        }
-
-        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-            auto be = ggml_parallel_backends[j];
-            if (!be->iface.get_tensor_async) {
-                ggml_backend_synchronize(be);
-            }
-        }
-
-        #ifndef GGML_BACKEND_TP_TENSOR_CPY
-        auto startTime = std::chrono::high_resolution_clock::now();
-        rejoin_tensor(tensor, extra);
-        auto time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
-        total_rejoin_times[ggml_op_name(tensor->op)] += time;
-        #endif
-
-
-        start = i + 1;
+    std::vector<struct compute_thread *> threads;
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto thread = new compute_thread();
+        thread->device_index = j;
+        thread->cgraph = cgraph;
+        thread->peers = &threads;
+        thread->done.lock();
+        threads.push_back(thread);
     }
 
+    for (auto thread : threads) {
+        ggml_backend_tp_threadpool_enqueue(&ggml_device_threadpool, (thread_task_func)ggml_backend_tp_buffer_graph_compute_one, thread);
+    }
 
-    return GGML_STATUS_SUCCESS;
+    bool failed = false;
+    for (auto thread : threads) {
+        thread->done.lock();
+        if (thread->end != cgraph->n_nodes) {
+            failed = true;
+            break;
+        }
+    }
 
-    bool late_rejoin = true;
+    printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
+    lastStartTime = std::chrono::high_resolution_clock::now();
+
+
+    return failed ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+
+    bool late_rejoin = false;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         auto tensor = cgraph->nodes[i];
@@ -844,6 +838,47 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
 
         extra->computed = true;
 
+        #ifdef GGML_BACKEND_TP_TENSOR_CPY
+        if (extra->has_rejoin) {
+            for (int device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
+                auto wrapped = extra->tensors[device_index];
+                auto be = ggml_parallel_backends[device_index];
+
+                // async copies
+                for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
+                    auto other_be = ggml_parallel_backends[other_device_index];
+                    auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
+                    if (!rejoined_tensor_view) {
+                        break;
+                    }
+    
+                    if (!be->iface.cpy_tensor_async) {
+                        continue;
+                    }
+    
+                    if (!be->iface.cpy_tensor_async(be, other_be, wrapped, rejoined_tensor_view)) {
+                        ggml_backend_tensor_copy(wrapped, rejoined_tensor_view);
+                    }
+                }
+    
+                // sync copies
+                for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
+                    auto other_be = ggml_parallel_backends[other_device_index];
+                    auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
+                    if (!rejoined_tensor_view) {
+                        break;
+                    }
+    
+                    if (be->iface.cpy_tensor_async) {
+                        continue;
+                    }
+    
+                    ggml_backend_tensor_copy(wrapped, rejoined_tensor_view);
+                }
+            }
+        }
+
+        #else
         // // this split op needs to be recombined for the another op
         if (!late_rejoin && extra->has_rejoin) {
             for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -858,6 +893,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             auto time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
             total_rejoin_times[ggml_op_name(tensor->op)] += time;
         }
+        #endif
 
 #if GGML_BACKEND_TP_VALIDATE
         auto src0 = tensor->src[0];

@@ -55,6 +55,15 @@ void ggml_backend_tp_threadpool_enqueue(ggml_backend_tp_threadpool* pool, thread
  */
 void ggml_backend_tp_threadpool_destroy(ggml_backend_tp_threadpool* pool);
 
+
+typedef struct ggml_backend_tp_semaphore {
+    std::mutex mutex;
+    std::condition_variable cv;
+    int count;
+};
+
+void ggml_backend_tp_semaphore_release(ggml_backend_tp_semaphore * semaphore, int n = 1);
+void ggml_backend_tp_semaphore_acquire(ggml_backend_tp_semaphore * semaphore);
 #ifdef __cplusplus
 }
 #endif

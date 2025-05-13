@@ -61,3 +61,18 @@ void ggml_backend_tp_threadpool_destroy(ggml_backend_tp_threadpool* pool) {
 
     pool->workers.clear();
 }
+
+
+void ggml_backend_tp_semaphore_release(ggml_backend_tp_semaphore * semaphore, int n) {
+    std::unique_lock<std::mutex> lock(semaphore->mutex);
+    semaphore->count += n;
+    for (int i = 0; i < n; ++i) {
+        semaphore->cv.notify_one();
+    }
+}
+
+void ggml_backend_tp_semaphore_acquire(ggml_backend_tp_semaphore * semaphore) {
+    std::unique_lock<std::mutex> lock(semaphore->mutex);
+    semaphore->cv.wait(lock, [semaphore]() { return semaphore->count > 0; });
+    --semaphore->count;
+}
