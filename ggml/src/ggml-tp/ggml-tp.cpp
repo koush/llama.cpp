@@ -253,7 +253,7 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-        case GGML_OP_RESHAPE:
+        // case GGML_OP_RESHAPE:
         // case GGML_OP_ROPE:
         // case GGML_OP_CPY:
             return true;
@@ -692,6 +692,19 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     std::set<ggml_backend_tp_buffer_context *> contexts;
     for (auto tensor : tensors) {
         auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+        if (tensor->view_src && extra->needs_src_rejoin) {
+            auto view_src = tensor->view_src;
+            auto view_src_extra = (ggml_tensor_parallel_extra *)view_src->extra;
+            if (view_src_extra->has_rejoin) {
+                for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                    auto rejoined = view_src_extra->converted_tensors[j];
+                    auto wrapped = extra->tensors[j];
+                    wrapped->view_src = rejoined;
+                    wrapped->view_offs = extra->rejoined_buft_offsets[j];
+                    wrapped->data = (char *)rejoined->data + wrapped->view_offs;
+                }
+            }
+        }
         if (!extra->has_rejoin) {
             continue;
         }
@@ -1564,7 +1577,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             auto view_src = view_src_extra->tensors[j];
             if (!tensor_is_split_compatible && view_src_extra->split_tensors) {
                 ensure_rejoined(tensor, tensor->view_src);
-                view_src = view_src_extra->converted_tensors[j];
+                // the real view src is going to be late init for this.
             }
             auto rem = tensor->view_offs % alignment;
             auto view_offs = tensor->view_offs / alignment * device_alignment + rem;
