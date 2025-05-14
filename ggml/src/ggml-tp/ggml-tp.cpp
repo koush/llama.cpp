@@ -152,7 +152,7 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         auto src = tensor->src[i];
         if (!src) {
-            continue;
+            break;
         }
 
         unwrap_tensor(src, tensors);
@@ -624,7 +624,7 @@ static bool cancompute(std::set<ggml_tensor*> & computing, std::set<ggml_tensor*
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         auto src = tensor->src[i];
         if (!src) {
-            continue;
+            break;
         }
 
         if (computing.find(src) == computing.end()) {
@@ -646,7 +646,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     auto startTime = std::chrono::high_resolution_clock::now();
     auto cgraph = thread->cgraph;
 
-    std::set<ggml_tensor*> computing;
+    // std::set<ggml_tensor*> computing;
     // std::set<ggml_tensor*> computed;
     // for (int i = 0; i < cgraph->n_nodes; i++) {
     //     auto tensor = cgraph->nodes[i];
@@ -665,11 +665,14 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     //                 start++;
     //             }
     //         }
+    //         else {
+    //             break;
+    //         }
     //     }
 
     //     computed.insert(pending_compute.begin(), pending_compute.end());
+    //     printf("TP graph compute %ld / %d\n", computed.size(), cgraph->n_nodes);
     // }
-    // printf("TP graph compute %ld / %d\n", computed.size(), cgraph->n_nodes);
 
     auto device_index = thread->device_index;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
@@ -872,7 +875,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             for (int j = 0; j < GGML_MAX_SRC; j++) {
                 auto src = tensor->src[j];
                 if (!src) {
-                    continue;
+                    break;
                 }
                 auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
                 if (src_extra->has_rejoin) {
@@ -1481,7 +1484,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = tensor->src[i];
             if (!src) {
-                continue;
+                break;
             }
             if (ggml_backend_buft_is_tp_split(src->buffer->buft)) {
                 GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s is split but src %s is not split compatible\n", tensor->name, src->name);
@@ -1496,7 +1499,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = tensor->src[i];
             if (!src) {
-                continue;
+                break;
             }
             if (ggml_backend_tp_is_split(src)) {
                 split = true;
@@ -1521,7 +1524,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 for (int i = 0; i < GGML_MAX_SRC; i++) {
                     auto src = tensor->src[i];
                     if (!src) {
-                        continue;
+                        break;
                     }
                     ensure_split(src);
                 }
@@ -1850,7 +1853,7 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = op->src[i];
             if (!src) {
-                continue;
+                break;
             }
             if (src->buffer && ggml_backend_buft_is_tp_split(src->buffer->buft)) {
                 return false;
