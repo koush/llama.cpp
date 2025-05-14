@@ -2473,8 +2473,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
         // why is this here? the purpose of this method is specificallyf or an async copy.
         // this stream wait causes 20% perf loss in tensor parallel backend.
-        // // wait on dst stream for the copy to complete
-        // CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+        // wait on dst stream for the copy to complete
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
         if (same_layout) {

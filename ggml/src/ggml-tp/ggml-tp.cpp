@@ -646,34 +646,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     auto startTime = std::chrono::high_resolution_clock::now();
     auto cgraph = thread->cgraph;
 
-    // std::set<ggml_tensor*> computing;
-    // std::set<ggml_tensor*> computed;
-    // for (int i = 0; i < cgraph->n_nodes; i++) {
-    //     auto tensor = cgraph->nodes[i];
-    //     computing.insert(tensor);
-    // }
-
-    // int start = 0;
-    // while ((int)computed.size() != cgraph->n_nodes) {
-    //     std::set<ggml_tensor*> pending_compute;
-
-    //     for (int i = start; i < cgraph->n_nodes; i++) {
-    //         auto tensor = cgraph->nodes[i];
-    //         if (cancompute(computing, computed, tensor)) {
-    //             pending_compute.insert(tensor);
-    //             if (start == i) {
-    //                 start++;
-    //             }
-    //         }
-    //         else {
-    //             break;
-    //         }
-    //     }
-
-    //     computed.insert(pending_compute.begin(), pending_compute.end());
-    //     printf("TP graph compute %ld / %d\n", computed.size(), cgraph->n_nodes);
-    // }
-
     auto device_index = thread->device_index;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
         auto tensor = cgraph->nodes[node_index];
