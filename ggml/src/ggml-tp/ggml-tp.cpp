@@ -610,19 +610,17 @@ typedef struct compute_thread {
 } compute_thread;
 
 static void release_peers(struct compute_thread * thread) {
-    for (int i = 0; i < thread->peers->size(); i++) {
+    for (size_t i = 0; i < thread->peers->size(); i++) {
         auto t = thread->peers->at(i);
         ggml_backend_tp_semaphore_release(&t->semaphore, 1);
     }
 }
 
 static bool cancompute(std::set<ggml_tensor*> & computing, std::set<ggml_tensor*> & computed, ggml_tensor * tensor) {
-    if (computing.find(tensor) == computing.end()) {
+    if (computed.find(tensor) != computed.end()) {
         return false;
     }
-    auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
-    auto all_src_computed = true;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         auto src = tensor->src[i];
         if (!src) {
@@ -646,27 +644,32 @@ static bool cancompute(std::set<ggml_tensor*> & computing, std::set<ggml_tensor*
 
 static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thread) {
     auto startTime = std::chrono::high_resolution_clock::now();
+    auto cgraph = thread->cgraph;
 
     std::set<ggml_tensor*> computing;
-    std::set<ggml_tensor*> computed;
-    auto cgraph = thread->cgraph;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        auto tensor = cgraph->nodes[i];
-        computing.insert(tensor);
-    }
+    // std::set<ggml_tensor*> computed;
+    // for (int i = 0; i < cgraph->n_nodes; i++) {
+    //     auto tensor = cgraph->nodes[i];
+    //     computing.insert(tensor);
+    // }
 
-    while (computed.size() != cgraph->n_nodes) {
-        std::set<ggml_tensor*> pending_compute;
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            auto tensor = cgraph->nodes[i];
-            if (cancompute(computing, computed, tensor)) {
-                pending_compute.insert(tensor);
-            }
-        }
-        printf("TP graph compute %d / %d\n", computed.size(), cgraph->n_nodes);
+    // int start = 0;
+    // while ((int)computed.size() != cgraph->n_nodes) {
+    //     std::set<ggml_tensor*> pending_compute;
 
-        computed.insert(pending_compute.begin(), pending_compute.end());
-    }
+    //     for (int i = start; i < cgraph->n_nodes; i++) {
+    //         auto tensor = cgraph->nodes[i];
+    //         if (cancompute(computing, computed, tensor)) {
+    //             pending_compute.insert(tensor);
+    //             if (start == i) {
+    //                 start++;
+    //             }
+    //         }
+    //     }
+
+    //     computed.insert(pending_compute.begin(), pending_compute.end());
+    // }
+    // printf("TP graph compute %ld / %d\n", computed.size(), cgraph->n_nodes);
 
     auto device_index = thread->device_index;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
@@ -707,7 +710,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
             // sync copies
             for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
-                auto other_be = ggml_parallel_backends[other_device_index];
                 auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
                 if (!rejoined_tensor_view) {
                     break;
@@ -727,6 +729,18 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             for (size_t i = 0; i < thread->peers->size(); i++) {
                 ggml_backend_tp_semaphore_acquire(&thread->semaphore);
             }
+
+            if (device_index == 0) {
+                for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                    auto backend = ggml_parallel_backends[j];
+                    if (backend->iface.synchronize) {
+                        backend->iface.synchronize(backend);
+                    }
+                    backend->iface.synchronize(backend);
+                }
+                release_peers(thread);
+            }
+            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
 
             #ifndef GGML_BACKEND_TP_TENSOR_CPY
             if (device_index == 0) {
@@ -881,7 +895,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
 
         #ifdef GGML_BACKEND_TP_TENSOR_CPY
         if (extra->has_rejoin) {
-            for (int device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
+            for (size_t device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
                 auto wrapped = extra->tensors[device_index];
                 auto be = ggml_parallel_backends[device_index];
 
@@ -904,7 +918,6 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     
                 // sync copies
                 for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
-                    auto other_be = ggml_parallel_backends[other_device_index];
                     auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
                     if (!rejoined_tensor_view) {
                         break;

@@ -60,7 +60,7 @@ typedef struct ggml_backend_tp_semaphore {
     std::mutex mutex;
     std::condition_variable cv;
     int count;
-};
+} ggml_backend_tp_semaphore;
 
 void ggml_backend_tp_semaphore_release(ggml_backend_tp_semaphore * semaphore, int n = 1);
 void ggml_backend_tp_semaphore_acquire(ggml_backend_tp_semaphore * semaphore);
