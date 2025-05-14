@@ -732,7 +732,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     release_peers(thread);
     thread->done.unlock();
 
-    // printf("TP graph %d compute time: %ld us\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count());
+    printf("TP graph %d compute time: %ld us\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count());
 }
 
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -801,34 +801,34 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
 
     std::map<std::string, int64_t> total_rejoin_times;
 
-    // std::vector<struct compute_thread *> threads;
-    // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-    //     auto thread = new compute_thread();
-    //     thread->device_index = j;
-    //     thread->cgraph = cgraph;
-    //     thread->peers = &threads;
-    //     thread->done.lock();
-    //     threads.push_back(thread);
-    // }
+    std::vector<struct compute_thread *> threads;
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto thread = new compute_thread();
+        thread->device_index = j;
+        thread->cgraph = cgraph;
+        thread->peers = &threads;
+        thread->done.lock();
+        threads.push_back(thread);
+    }
 
-    // for (auto thread : threads) {
-    //     ggml_backend_tp_threadpool_enqueue(&ggml_device_threadpool, (thread_task_func)ggml_backend_tp_buffer_graph_compute_one, thread);
-    // }
+    for (auto thread : threads) {
+        ggml_backend_tp_threadpool_enqueue(&ggml_device_threadpool, (thread_task_func)ggml_backend_tp_buffer_graph_compute_one, thread);
+    }
 
-    // bool failed = false;
-    // for (auto thread : threads) {
-    //     thread->done.lock();
-    //     if (thread->end != cgraph->n_nodes) {
-    //         failed = true;
-    //         break;
-    //     }
-    // }
+    bool failed = false;
+    for (auto thread : threads) {
+        thread->done.lock();
+        if (thread->end != cgraph->n_nodes) {
+            failed = true;
+            break;
+        }
+    }
 
-    // printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
-    // lastStartTime = std::chrono::high_resolution_clock::now();
+    printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
+    lastStartTime = std::chrono::high_resolution_clock::now();
 
 
-    // return failed ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+    return failed ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
 
     bool late_rejoin = false;
 
@@ -1163,7 +1163,7 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
         }
 
         if (tensor->ne[1] != 1) {
-            // weight matrices are transposed, so split on row
+            // weight matrices used for mul mat are transposed, so split on row
             ggml_split splits = get_row_splits(tensor);
             size_t cur_row = 0;
             for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -1191,19 +1191,12 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
             }
         }
         else {
-            // weight matrices are transposed, so split on row
-            auto block_size = ggml_blck_size(tensor->type);
-            auto blocks_per_row = tensor->ne[0] / block_size;
-            auto elements_per_block = tensor->ne[0] / blocks_per_row;
-            auto splits = get_dim_splits(blocks_per_row);
-
-            size_t cur_block = 0;
+            auto split_offset = 0;
             for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
                 auto wrapped = extra->tensors[j];
                 auto be = ggml_parallel_backends[j];
 
-                auto split_offset = cur_block * block_size;
-                auto split_size = (size_t) splits.split[j] * block_size;
+                auto split_size = wrapped->nb[1];
 
                 if (be->iface.set_tensor_async) {
                     be->iface.set_tensor_async(be, wrapped, (const char *) data + split_offset, 0, split_size);
@@ -1212,8 +1205,7 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
                     auto backend_buffer = ctx->backend_buffers[j];
                     backend_buffer->iface.set_tensor(backend_buffer, wrapped, (const char *) data + split_offset, 0, split_size);
                 }
-
-                cur_block += splits.split[j];
+                split_offset += split_size;
             }
         }
 
@@ -1870,7 +1862,7 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
                 if (src->ne[1] != 1) {
                     return false;
                 }
-                return false;
+                return true;
             }
         }
     }
