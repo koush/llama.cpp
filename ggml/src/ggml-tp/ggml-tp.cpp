@@ -829,34 +829,34 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
 
     std::map<std::string, int64_t> total_rejoin_times;
 
-    std::vector<struct compute_thread *> threads;
-    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        auto thread = new compute_thread();
-        thread->device_index = j;
-        thread->cgraph = cgraph;
-        thread->peers = &threads;
-        thread->done.lock();
-        threads.push_back(thread);
-    }
+    // std::vector<struct compute_thread *> threads;
+    // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+    //     auto thread = new compute_thread();
+    //     thread->device_index = j;
+    //     thread->cgraph = cgraph;
+    //     thread->peers = &threads;
+    //     thread->done.lock();
+    //     threads.push_back(thread);
+    // }
 
-    for (auto thread : threads) {
-        ggml_backend_tp_threadpool_enqueue(&ggml_device_threadpool, (thread_task_func)ggml_backend_tp_buffer_graph_compute_one, thread);
-    }
+    // for (auto thread : threads) {
+    //     ggml_backend_tp_threadpool_enqueue(&ggml_device_threadpool, (thread_task_func)ggml_backend_tp_buffer_graph_compute_one, thread);
+    // }
 
-    bool failed = false;
-    for (auto thread : threads) {
-        thread->done.lock();
-        if (thread->end != cgraph->n_nodes) {
-            failed = true;
-            break;
-        }
-    }
+    // bool failed = false;
+    // for (auto thread : threads) {
+    //     thread->done.lock();
+    //     if (thread->end != cgraph->n_nodes) {
+    //         failed = true;
+    //         break;
+    //     }
+    // }
 
-    printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
-    lastStartTime = std::chrono::high_resolution_clock::now();
+    // printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
+    // lastStartTime = std::chrono::high_resolution_clock::now();
 
 
-    return failed ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+    // return failed ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
 
     bool late_rejoin = false;
 
@@ -1898,7 +1898,7 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
                 if (src->ne[1] != 1) {
                     return false;
                 }
-                return true;
+                return false;
             }
         }
     }
