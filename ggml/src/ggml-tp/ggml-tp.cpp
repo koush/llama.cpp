@@ -52,8 +52,6 @@ struct ggml_tensor_parallel_extra {
     size_t original_size;
 #endif
 
-    bool computed;
-
     // persist the split tensor memory layout for reshaped tensors
     int64_t original_ne1;
     size_t original_nb1;
@@ -618,10 +616,58 @@ static void release_peers(struct compute_thread * thread) {
     }
 }
 
+static bool cancompute(std::set<ggml_tensor*> & computing, std::set<ggml_tensor*> & computed, ggml_tensor * tensor) {
+    if (computing.find(tensor) == computing.end()) {
+        return false;
+    }
+    auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+
+    auto all_src_computed = true;
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        auto src = tensor->src[i];
+        if (!src) {
+            continue;
+        }
+
+        if (computing.find(src) == computing.end()) {
+            continue;
+        }
+        if (tensor == src) {
+            continue;
+        }
+
+        if (computed.find(src) == computed.end()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thread) {
     auto startTime = std::chrono::high_resolution_clock::now();
 
+    std::set<ggml_tensor*> computing;
+    std::set<ggml_tensor*> computed;
     auto cgraph = thread->cgraph;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        auto tensor = cgraph->nodes[i];
+        computing.insert(tensor);
+    }
+
+    while (computed.size() != cgraph->n_nodes) {
+        std::set<ggml_tensor*> pending_compute;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            auto tensor = cgraph->nodes[i];
+            if (cancompute(computing, computed, tensor)) {
+                pending_compute.insert(tensor);
+            }
+        }
+        printf("TP graph compute %d / %d\n", computed.size(), cgraph->n_nodes);
+
+        computed.insert(pending_compute.begin(), pending_compute.end());
+    }
+
     auto device_index = thread->device_index;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
         auto tensor = cgraph->nodes[node_index];
@@ -636,8 +682,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             thread->done.unlock();
             return;
         }
-
-        extra->computed = true;
 
         // // this split op needs to be recombined for the another op
         if (extra->has_rejoin) {
@@ -712,7 +756,6 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
         // reset the rejoined state in case this tensor needs it.
         extra->rejoined = false;
-        extra->computed = false;
         unwrap_tensor(tensor, tensors);
     }
 
@@ -835,8 +878,6 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
                 return status;
             }
         }
-
-        extra->computed = true;
 
         #ifdef GGML_BACKEND_TP_TENSOR_CPY
         if (extra->has_rejoin) {
@@ -1091,7 +1132,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         printf("Rejoin time for %s: %ld us\n", rejoin_time.first.c_str(), rejoin_time.second);
     }
 
-    printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
+    // printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
     lastStartTime = std::chrono::high_resolution_clock::now();
 
     return GGML_STATUS_SUCCESS;
