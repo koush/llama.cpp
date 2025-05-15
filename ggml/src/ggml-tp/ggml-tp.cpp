@@ -698,7 +698,14 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             }
             ggml_backend_tp_semaphore_acquire(&thread->semaphore);
         
-#ifdef GGML_BACKEND_TP_TENSOR_CPY
+#ifndef GGML_BACKEND_TP_TENSOR_CPY
+            if (device_index == 0) {
+                rejoin_tensor(tensor, extra);
+                release_peers(thread);
+            }
+        
+            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
+
             if (device_index == 0) {
                 for (int i = 0; i <GGML_MAX_SRC; i++) {
                     auto src = tensor->src[i];
@@ -710,13 +717,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
                         rejoin_tensor(src, src_extra);
                     }
                 }
-                release_peers(thread);
-            }
-
-            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
-#else
-            if (device_index == 0) {
-                rejoin_tensor(tensor, extra);
                 release_peers(thread);
             }
 
