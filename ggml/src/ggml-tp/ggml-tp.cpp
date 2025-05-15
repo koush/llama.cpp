@@ -19,8 +19,8 @@
 #include <set>
 #include <thread>
 
-// #define GGML_BACKEND_TP_VALIDATE 1
 #define NUM_DEVICES 1
+#define USE_MUL_MAT_REDUCE 1
 
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
 static std::vector<ggml_backend_t> ggml_parallel_backends;
@@ -79,6 +79,7 @@ struct ggml_tensor_parallel_extra {
     ggml_tensor * rejoined_tensor_views[TP_MAX_DEVICES][TP_MAX_DEVICES];
 
     bool weight_column_split;
+    bool has_reduce;
 
     ~ggml_tensor_parallel_extra() {
         if (rejoined_buffer) {
@@ -234,6 +235,9 @@ static bool ggml_backend_tp_is_split(ggml_tensor * tensor) {
     }
 
     auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+    if (extra->has_rejoin) {
+        return false;
+    }
     return extra->split_tensors;
 }
 
@@ -457,12 +461,14 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
 
     auto ctx = (ggml_backend_tp_buffer_context *)src->buffer->context;
 
+    auto reduce_scale = src_extra->has_reduce ? ggml_parallel_devices.size() : 1;
+
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto dev = ggml_parallel_devices[j];
         auto buffer_type = dev->iface.get_buffer_type(dev);
 
         auto tensor_size = buffer_type->iface.get_alloc_size(buffer_type, src);
-        auto aligned_size = ggml_align_size(tensor_size, alignment);
+        auto aligned_size = ggml_align_size(tensor_size, alignment) * reduce_scale;
 
         ggml_tensor * rejoined = ggml_backend_tp_clone_tensor(src);
         src_extra->converted_tensors[j] = rejoined;
@@ -487,25 +493,36 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     // A A B B C C D D
     // A A B B C C D D
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto dev = ggml_parallel_devices[j];
+        auto buffer_type = dev->iface.get_buffer_type(dev);
+        auto tensor_size = buffer_type->iface.get_alloc_size(buffer_type, src);
+        auto aligned_size = ggml_align_size(tensor_size, alignment);
+
         auto rejoined = src_extra->converted_tensors[j];
 
+        size_t reduce_offset = 0;
         size_t col_offset = 0;
         for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
             auto view = ggml_backend_tp_clone_tensor(view_src);
             src_extra->rejoined_tensor_views[j][i] = view;
 
             view->view_src = rejoined;
-            view->ne[0] = splits.split[i];
-            // adjust the offset to the start of the column in the destination tensor
-            view->view_offs = view_src->nb[1] / view_src->ne[0] * col_offset;
+            if (src_extra->has_reduce) {
+                // adjust the offset to the start of the last tensor
+                view->view_offs = reduce_offset;
+            }
+            else {
+                view->ne[0] = splits.split[i];
+                // adjust the offset to the start of the column in the destination tensor
+                view->view_offs = view_src->nb[1] / view_src->ne[0] * col_offset;
+            }
 
             col_offset += splits.split[j];
+            reduce_offset += aligned_size;
         }
     }
 
     return GGML_STATUS_SUCCESS;
-
-    GGML_UNUSED(reason);
 }
 
 static int memdiff_index(const char *a, const char *b, size_t length) {
@@ -629,6 +646,19 @@ static void release_peers(struct compute_thread * thread) {
     }
 }
 
+static void reduce_joined_tensors(ggml_tensor * tensor) {
+    auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+    if (!extra->has_reduce) {
+        return;
+    }
+
+    if (!extra->has_rejoin) {
+        return;
+    }
+
+    int i = 0;
+}
+
 static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thread) {
     auto startTime = std::chrono::high_resolution_clock::now();
     auto cgraph = thread->cgraph;
@@ -642,6 +672,10 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
         auto wrapped = extra->tensors[device_index];
         auto be = ggml_parallel_backends[device_index];
+
+        // if (extra->needs_src_rejoin) {
+        //     printf("Tensor %s needs src rejoin\n", ggml_op_name(tensor->op));
+        // }
 
         // wait for async memcpy to finish if needed
         if (extra->needs_src_rejoin && pending_rejoins.size()) {
@@ -666,6 +700,15 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
                 release_peers(thread);
             }
             ggml_backend_tp_semaphore_acquire(&thread->semaphore);
+
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                auto src = tensor->src[i];
+                if (!src) {
+                    break;
+                }
+
+                reduce_joined_tensors(src);
+            }
         }
 
         ggml_status status = be->iface.node_compute(be, wrapped);
@@ -759,8 +802,8 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
                     auto rejoined = view_src_extra->converted_tensors[j];
                     auto wrapped = extra->tensors[j];
                     wrapped->view_src = rejoined;
-                    wrapped->view_offs = extra->rejoined_buft_offsets[j];
                     wrapped->data = (char *)rejoined->data + wrapped->view_offs;
+                    wrapped->view_offs = extra->rejoined_buft_offsets[j];
                 }
             }
         }
@@ -794,7 +837,6 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
                 rejoined_tensor_view->buffer = buft;
                 rejoined_tensor_view->data = (char *) rejoined->data + rejoined_tensor_view->view_offs;
                 rejoined_tensor_view->view_src = rejoined;
-                rejoined_tensor_view->view_offs = extra->rejoined_buft_offsets[j];
             }
         }
     }
@@ -1272,6 +1314,15 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 break;
             }
             if (ggml_backend_tp_is_split(src)) {
+                auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+                // a pending reduce can be fused with subsequent adds.
+                if (src_extra->has_reduce) {
+                    if (tensor->op != GGML_OP_ADD) {
+                        ensure_rejoined(tensor, src);
+                        continue;
+                    }
+                    extra->has_reduce = true;
+                }
                 split = true;
                 split_from_src = true;
                 break;
@@ -1282,7 +1333,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         // mulmat can handle the broadcast "A" tensor.
         if (split_from_src) {
             if (tensor->op == GGML_OP_MUL_MAT) {
-                if (true) {
+                if (!USE_MUL_MAT_REDUCE) {
                     ensure_rejoined(tensor, tensor->src[1]);
                 }
                 else {
@@ -1310,26 +1361,8 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         }
                         else {
                             ensure_weight_column_split(src0, tensor);
-                            // this mul mat needs to be sum reduced, and rejoining
-                            // will be on columns which is not ideal for memory layout.
-                            // temporarily adjust the tensor so flatten down to a single row
-                            // creating rejoins it into a sequential memory layout.
-                            // multiply by the number of devices to create enough space for the reduce.
-                            extra->split_tensors = true;
-                            auto original_ne1 = tensor->ne[1];
-                            tensor->ne[0] *= original_ne1 * ggml_parallel_devices.size();
-                            tensor->ne[1] = 1;
-                            tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(tensor->type));
-                            tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
-                            tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
-                            extra->original_ne1 = tensor->ne[1];
-                            extra->original_nb1 = tensor->nb[1];
-                            ensure_rejoined(nullptr, tensor);
-                            tensor->ne[0] /= (original_ne1 * ggml_parallel_devices.size());
-                            tensor->ne[1] = original_ne1;
-                            tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(tensor->type));
-                            tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
-                            tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
+                            extra->has_reduce = true;
+
                         }
                     }
                 }
@@ -1454,12 +1487,14 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                             wrapped->nb[3] = src_extra->tensors[j]->nb[3];
                         }
                         else {
-                            // update col count
-                            wrapped->ne[0] = splits.split[j];
-                            // adjust the stride for the new row count
-                            wrapped->nb[1] = wrapped->nb[1] / original_ne0 * splits.split[j];
-                            wrapped->nb[2] = wrapped->nb[2] / original_ne0 * splits.split[j];
-                            wrapped->nb[3] = wrapped->nb[3] / original_ne0 * splits.split[j];
+                            if (!extra->has_reduce) {
+                                // update col count
+                                wrapped->ne[0] = splits.split[j];
+                                // adjust the stride for the new row count
+                                wrapped->nb[1] = wrapped->nb[1] / original_ne0 * splits.split[j];
+                                wrapped->nb[2] = wrapped->nb[2] / original_ne0 * splits.split[j];
+                                wrapped->nb[3] = wrapped->nb[3] / original_ne0 * splits.split[j];
+                            }
                         }
                     }
                 }
