@@ -79,6 +79,8 @@ struct ggml_tensor_parallel_extra {
     // each device will provide a view of their full data for other devices as copy destinations.
     ggml_tensor * rejoined_tensor_views[TP_MAX_DEVICES][TP_MAX_DEVICES];
 
+    bool weight_column_split;
+
     ~ggml_tensor_parallel_extra() {
         if (rejoined_buffer) {
             free(rejoined_buffer);
@@ -188,6 +190,9 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
                 else {
                     wrapped->src[1] = src1_extra->tensors[j];
                 }
+                if (!wrapped->src[i]) {
+                    wrapped->src[1] = src1_extra->tensors[j];
+                }
             }
 
             if (!wrapped->src[i]) {
@@ -251,7 +256,8 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-        case GGML_OP_RESHAPE:
+        // case GGML_OP_RESHAPE:
+        // case GGML_OP_PERMUTE:
         // case GGML_OP_ROPE:
         // case GGML_OP_CPY:
             return true;
@@ -650,6 +656,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     auto startTime = std::chrono::high_resolution_clock::now();
     auto cgraph = thread->cgraph;
 
+    int rejoins = 0;
     auto device_index = thread->device_index;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
         auto tensor = cgraph->nodes[node_index];
@@ -657,54 +664,20 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
         auto wrapped = extra->tensors[device_index];
         auto be = ggml_parallel_backends[device_index];
-        ggml_status status = be->iface.node_compute(be, wrapped);
-        if (status != GGML_STATUS_SUCCESS) {
-            thread->end = status;
-            release_peers(thread);
-            thread->done.unlock();
-            return;
+
+        if (tensor->op == GGML_OP_MUL_MAT) {
+            const auto src0 = tensor->src[0];
+            const auto src1 = tensor->src[1];
+            auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
+            auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
+            if (src0_extra->split_tensors && src1_extra->split_tensors) {
+                int i =0;
+            }
         }
 
-        // // this split op needs to be recombined for the another op
-        if (extra->has_rejoin) {
-            // copy this tensor to rejoined tensor views on all other devices.
-
-#ifdef GGML_BACKEND_TP_TENSOR_CPY
-            // async copies
-            for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
-                auto other_be = ggml_parallel_backends[other_device_index];
-                auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
-                if (!rejoined_tensor_view) {
-                    break;
-                }
-
-                if (!be->iface.cpy_tensor_async) {
-                    continue;
-                }
-
-                auto view_src = wrapped;
-                while (view_src->view_src) {
-                    view_src = view_src->view_src;
-                }
-                if (!be->iface.cpy_tensor_async(be, other_be, view_src, rejoined_tensor_view)) {
-                    ggml_backend_tensor_copy(view_src, rejoined_tensor_view);
-                }
-            }
-
-            // sync copies
-            for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
-                auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
-                if (!rejoined_tensor_view) {
-                    break;
-                }
-
-                if (be->iface.cpy_tensor_async) {
-                    continue;
-                }
-
-                ggml_backend_tensor_copy(wrapped, rejoined_tensor_view);
-            }
-#endif
+        // wait for async memcpy to finish if needed
+        if (extra->needs_src_rejoin) {
+            rejoins++;
             thread->end = node_index;
             release_peers(thread);
 
@@ -712,7 +685,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             for (size_t i = 0; i < thread->peers->size(); i++) {
                 ggml_backend_tp_semaphore_acquire(&thread->semaphore);
             }
-
+        
             if (device_index == 0) {
                 for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
                     auto backend = ggml_parallel_backends[j];
@@ -724,23 +697,84 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
                 release_peers(thread);
             }
             ggml_backend_tp_semaphore_acquire(&thread->semaphore);
+        
+#ifdef GGML_BACKEND_TP_TENSOR_CPY
+            if (device_index == 0) {
+                for (int i = 0; i <GGML_MAX_SRC; i++) {
+                    auto src = tensor->src[i];
+                    if (!src) {
+                        break;
+                    }
+                    auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+                    if (src_extra->has_rejoin) {
+                        rejoin_tensor(src, src_extra);
+                    }
+                }
+                release_peers(thread);
+            }
 
-            #ifndef GGML_BACKEND_TP_TENSOR_CPY
+            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
+#else
             if (device_index == 0) {
                 rejoin_tensor(tensor, extra);
                 release_peers(thread);
             }
 
             ggml_backend_tp_semaphore_acquire(&thread->semaphore);
-            #endif
+#endif
         }
+
+        ggml_status status = be->iface.node_compute(be, wrapped);
+        if (status != GGML_STATUS_SUCCESS) {
+            thread->end = status;
+            release_peers(thread);
+            thread->done.unlock();
+            return;
+        }
+
+#ifdef GGML_BACKEND_TP_TENSOR_CPY
+        // async copies
+        for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
+            auto other_be = ggml_parallel_backends[other_device_index];
+            auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
+            if (!rejoined_tensor_view) {
+                break;
+            }
+
+            if (!be->iface.cpy_tensor_async) {
+                continue;
+            }
+
+            auto view_src = wrapped;
+            while (view_src->view_src) {
+                view_src = view_src->view_src;
+            }
+            if (!be->iface.cpy_tensor_async(be, other_be, view_src, rejoined_tensor_view)) {
+                ggml_backend_tensor_copy(view_src, rejoined_tensor_view);
+            }
+        }
+
+        // sync copies
+        for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
+            auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
+            if (!rejoined_tensor_view) {
+                break;
+            }
+
+            if (be->iface.cpy_tensor_async) {
+                continue;
+            }
+
+            ggml_backend_tensor_copy(wrapped, rejoined_tensor_view);
+        }
+#endif
     }
 
     thread->end = cgraph->n_nodes;
     release_peers(thread);
     thread->done.unlock();
 
-    // printf("TP graph %d compute time: %ld us\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count());
+    printf("TP graph %d compute time: %ld us %d rejoins\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count(), rejoins);
 }
 
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -832,7 +866,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         }
     }
 
-    printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
+    // printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
     lastStartTime = std::chrono::high_resolution_clock::now();
 
 
@@ -1452,6 +1486,55 @@ static ggml_split get_alloc_splits(size_t size) {
     return splits;
 }
 
+static void ensure_weight_column_split(ggml_tensor * tensor) {
+    if (tensor->op != GGML_OP_NONE) {
+        return;
+    }
+
+    auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+    if (!extra->split_tensors) {
+        return;
+    }
+
+    if (extra->weight_column_split) {
+        return;
+    }
+    extra->weight_column_split = true;
+
+    auto size = ggml_nbytes(tensor);
+    std::unique_ptr<char, decltype(&std::free)> data(
+        static_cast<char*>(std::malloc(size)), &std::free);
+    size_t offset = 0;
+    for (int j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto wrapped = extra->tensors[j];
+        auto buft = wrapped->buffer;
+        auto wrapped_size = ggml_nbytes(wrapped);
+        buft->iface.get_tensor(buft, wrapped, data.get() + offset, 0, wrapped_size);
+        offset += ggml_nbytes(wrapped);
+    }
+
+
+    auto block_size = ggml_blck_size(tensor->type);
+    auto blocks_per_row = tensor->ne[0] / block_size;
+    auto elements_per_block = tensor->ne[0] / blocks_per_row;
+    auto splits = get_dim_splits(blocks_per_row);
+
+    offset = 0;
+    for (int j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto wrapped = extra->tensors[j];
+        wrapped->ne[0] = splits.split[j] * elements_per_block;
+        wrapped->ne[1] = tensor->ne[1];
+        wrapped->nb[1] = wrapped->nb[0] * (wrapped->ne[0] / ggml_blck_size(wrapped->type));
+        wrapped->nb[2] = wrapped->nb[1] * wrapped->ne[1];
+        wrapped->nb[3] = wrapped->nb[2] * wrapped->ne[2];
+        auto buft = wrapped->buffer;
+        auto buft_size = ggml_nbytes(wrapped);
+        // this is wrong but whatever
+        buft->iface.set_tensor(buft, wrapped, data.get() + offset, 0, buft_size);
+        offset += buft_size;
+    }
+}
+
 static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(buffer->buft);
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
@@ -1473,6 +1556,20 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
     //     GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor op %s is not split compatible but is marked as such\n", ggml_op_name(tensor->op));
     //     return GGML_STATUS_FAILED;
     // }
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        auto src = tensor->src[i];
+        if (!src) {
+            break;
+        }
+        if (src->op == GGML_OP_ROPE || src->op == GGML_OP_PERMUTE) {
+            auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+            if (src_extra->split_tensors) {
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: can't split RESHAPE tensor %s\n", src->name);
+                // return GGML_STATUS_FAILED;
+            }
+        }
+    }
 
     // check all src tensors to see if this tensor is split or the src tensors need a rejoin
     auto tensor_is_split_compatible = is_split_compatible(tensor);
@@ -1497,20 +1594,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             if (!src) {
                 break;
             }
-            if (src->op == GGML_OP_RESHAPE) {
-                auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-                if (src_extra->split_tensors) {
-                    GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: can't split RESHAPE tensor %s\n", src->name);
-                    return GGML_STATUS_FAILED;
-                }
-            }
-        }
-
-        for (int i = 0; i < GGML_MAX_SRC; i++) {
-            auto src = tensor->src[i];
-            if (!src) {
-                break;
-            }
             if (ggml_backend_tp_is_split(src)) {
                 split = true;
                 split_from_src = true;
@@ -1522,7 +1605,34 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         // mulmat can handle the broadcast "A" tensor.
         if (split_from_src) {
             if (tensor->op == GGML_OP_MUL_MAT) {
-                ensure_rejoined(tensor, tensor->src[1]);
+                if (true ) {
+                    ensure_rejoined(tensor, tensor->src[1]);
+
+                }
+                else {
+
+                    auto src0 = tensor->src[0];
+                    auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
+                    auto src1 = tensor->src[1];
+                    auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
+                    if (!src0_extra->split_tensors && src1_extra->split_tensors) {
+                        GGML_LOG_ERROR("ggml_backend_tp_buffer_init_tensor: tensor %s has split src1 but src0 is not split\n", tensor->name, src0->name);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    // if src1 is split, src0 must be a split weight.
+                    // however, split weights are split in the wrong direction, and
+                    // need to be re-split once.
+                    // if src0 is not a weight, rejoin src1 so it can be multiplied.
+                    if (src1_extra->split_tensors) {
+                        if (!ggml_backend_buft_is_tp_split(src0->buffer->buft)) {
+                            ensure_rejoined(tensor, tensor->src[1]);
+                        }
+                        else {
+                            ensure_weight_column_split(src0);
+                        }
+                    }
+                }
             }
             else if (tensor->op == GGML_OP_RESHAPE) {
                 auto src0 = tensor->src[0];
@@ -1612,22 +1722,22 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
                         auto src = tensor->src[0];
                         auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-                        // auto src_cols = src_extra->tensors[j]->ne[0];
+                        auto src_cols = src_extra->tensors[j]->ne[0];
 
-                        // if (src_cols > wrapped->ne[0]) {
-                        //     auto original_ne1 = wrapped->ne[1];
-                        //     wrapped->ne[1] = src_cols / wrapped->ne[0];
-                        //     wrapped->ne[2] = wrapped->ne[2] * original_ne1 / wrapped->ne[1];
-                        // }
-                        // else {
-                        //     auto original_ne0 = wrapped->ne[0];
-                        //     wrapped->ne[0] = src_cols;
-                        //     wrapped->ne[2] = wrapped->ne[2] * original_ne0 / wrapped->ne[0];
-                        // }
+                        if (src_cols > wrapped->ne[0]) {
+                            auto original_ne1 = wrapped->ne[1];
+                            wrapped->ne[1] = src_cols / wrapped->ne[0];
+                            wrapped->ne[2] = wrapped->ne[2] * original_ne1 / wrapped->ne[1];
+                        }
+                        else {
+                            auto original_ne0 = wrapped->ne[0];
+                            wrapped->ne[0] = src_cols;
+                            wrapped->ne[2] = wrapped->ne[2] * original_ne0 / wrapped->ne[0];
+                        }
 
-                        // wrapped->nb[1] = wrapped->nb[1] / original_ne0 * splits.split[j];
-                        // wrapped->nb[2] = wrapped->nb[0] * wrapped->ne[1];
-                        // wrapped->nb[3] = wrapped->nb[2] * wrapped->ne[2];
+                        wrapped->nb[1] = wrapped->nb[0] * wrapped->ne[0];
+                        wrapped->nb[2] = wrapped->nb[1] * wrapped->ne[1];
+                        wrapped->nb[3] = wrapped->nb[2] * wrapped->ne[2];
                     }
                     else {
                         if (tensor->op == GGML_OP_ROPE && split_from_src) {
@@ -1889,7 +1999,8 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
         }
     }
     else {
-        // only src0 is supported for split buffer.
+        // only src0 is supported for split buffer. src1 is never called here with a weight buffer,
+        // so this path is never actually used, only for sanity checking.
         auto src1 = op->src[1];
         if (src1->buffer && ggml_backend_buft_is_tp_split(src1->buffer->buft)) {
             return false;
