@@ -21,7 +21,6 @@
 
 // #define GGML_BACKEND_TP_VALIDATE 1
 #define NUM_DEVICES 1
-#define GGML_BACKEND_TP_TENSOR_CPY
 
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
 static std::vector<ggml_backend_t> ggml_parallel_backends;
@@ -438,9 +437,11 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
         return GGML_STATUS_SUCCESS;
     }
 
-    auto reason_extra = (ggml_tensor_parallel_extra *)reason->extra;
-    if (!reason_extra->needs_src_rejoin) {
-        reason_extra->needs_src_rejoin = true;
+    if (reason) {
+        auto reason_extra = (ggml_tensor_parallel_extra *)reason->extra;
+        if (!reason_extra->needs_src_rejoin) {
+            reason_extra->needs_src_rejoin = true;
+        }
     }
 
     if (src_extra->has_rejoin) {
@@ -448,7 +449,9 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     }
     src_extra->has_rejoin = true;
 
-    // printf("Rejoining tensor for %s %d %d\n", ggml_op_name(reason->op), src->ne[0], src->ne[1]);
+    // if (reason && reason != src) {
+    //     printf("Rejoining tensor for %s %d %d\n", ggml_op_name(reason->op), src->ne[0], src->ne[1]);
+    // }
 
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(src->buffer->buft);
 
@@ -626,32 +629,6 @@ static void release_peers(struct compute_thread * thread) {
     }
 }
 
-static bool cancompute(std::set<ggml_tensor*> & computing, std::set<ggml_tensor*> & computed, ggml_tensor * tensor) {
-    if (computed.find(tensor) != computed.end()) {
-        return false;
-    }
-
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        auto src = tensor->src[i];
-        if (!src) {
-            break;
-        }
-
-        if (computing.find(src) == computing.end()) {
-            continue;
-        }
-        if (tensor == src) {
-            continue;
-        }
-
-        if (computed.find(src) == computed.end()) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thread) {
     auto startTime = std::chrono::high_resolution_clock::now();
     auto cgraph = thread->cgraph;
@@ -664,16 +641,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
         auto wrapped = extra->tensors[device_index];
         auto be = ggml_parallel_backends[device_index];
-
-        if (tensor->op == GGML_OP_MUL_MAT) {
-            const auto src0 = tensor->src[0];
-            const auto src1 = tensor->src[1];
-            auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
-            auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
-            if (src0_extra->split_tensors && src1_extra->split_tensors) {
-                int i =0;
-            }
-        }
 
         // wait for async memcpy to finish if needed
         if (extra->needs_src_rejoin) {
@@ -697,31 +664,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
                 release_peers(thread);
             }
             ggml_backend_tp_semaphore_acquire(&thread->semaphore);
-        
-#ifndef GGML_BACKEND_TP_TENSOR_CPY
-            if (device_index == 0) {
-                rejoin_tensor(tensor, extra);
-                release_peers(thread);
-            }
-        
-            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
-
-            if (device_index == 0) {
-                for (int i = 0; i <GGML_MAX_SRC; i++) {
-                    auto src = tensor->src[i];
-                    if (!src) {
-                        break;
-                    }
-                    auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-                    if (src_extra->has_rejoin) {
-                        rejoin_tensor(src, src_extra);
-                    }
-                }
-                release_peers(thread);
-            }
-
-            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
-#endif
         }
 
         ggml_status status = be->iface.node_compute(be, wrapped);
@@ -732,7 +674,20 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             return;
         }
 
-#ifdef GGML_BACKEND_TP_TENSOR_CPY
+        if (!extra->has_rejoin) {
+            continue;
+        }
+
+        if (tensor->op == GGML_OP_MUL_MAT) {
+            const auto src0 = tensor->src[0];
+            const auto src1 = tensor->src[1];
+            auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
+            auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
+            if (src0_extra->split_tensors && src1_extra->split_tensors) {
+                int i =0;
+            }
+        }
+
         // async copies
         for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
             auto other_be = ggml_parallel_backends[other_device_index];
@@ -767,7 +722,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
             ggml_backend_tensor_copy(wrapped, rejoined_tensor_view);
         }
-#endif
     }
 
     thread->end = cgraph->n_nodes;
@@ -869,303 +823,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     // printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
     lastStartTime = std::chrono::high_resolution_clock::now();
 
-
     return failed ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
-
-    bool late_rejoin = false;
-
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        auto tensor = cgraph->nodes[i];
-        auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
-
-        if (late_rejoin && extra->needs_src_rejoin) {
-            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-                auto be = ggml_parallel_backends[j];
-                if (!be->iface.get_tensor_async) {
-                    ggml_backend_synchronize(be);
-                }
-            }
-
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                auto src = tensor->src[j];
-                if (!src) {
-                    break;
-                }
-                auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-                if (src_extra->has_rejoin) {
-                    auto startTime = std::chrono::high_resolution_clock::now();
-                    rejoin_tensor(src, src_extra);
-                    auto time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
-                    total_rejoin_times[ggml_op_name(tensor->op)] += time;
-                }
-            }
-        }
-
-        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-            auto wrapped = extra->tensors[j];
-            auto be = ggml_parallel_backends[j];
-            ggml_status status = be->iface.node_compute(be, wrapped);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
-        }
-
-        #ifdef GGML_BACKEND_TP_TENSOR_CPY
-        if (extra->has_rejoin) {
-            for (size_t device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
-                auto wrapped = extra->tensors[device_index];
-                auto be = ggml_parallel_backends[device_index];
-
-                // async copies
-                for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
-                    auto other_be = ggml_parallel_backends[other_device_index];
-                    auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
-                    if (!rejoined_tensor_view) {
-                        break;
-                    }
-    
-                    if (!be->iface.cpy_tensor_async) {
-                        continue;
-                    }
-    
-                    if (!be->iface.cpy_tensor_async(be, other_be, wrapped, rejoined_tensor_view)) {
-                        ggml_backend_tensor_copy(wrapped, rejoined_tensor_view);
-                    }
-                }
-    
-                // sync copies
-                for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
-                    auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
-                    if (!rejoined_tensor_view) {
-                        break;
-                    }
-    
-                    if (be->iface.cpy_tensor_async) {
-                        continue;
-                    }
-    
-                    ggml_backend_tensor_copy(wrapped, rejoined_tensor_view);
-                }
-            }
-        }
-
-        #else
-        // // this split op needs to be recombined for the another op
-        if (!late_rejoin && extra->has_rejoin) {
-            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-                auto be = ggml_parallel_backends[j];
-                if (!be->iface.get_tensor_async) {
-                    ggml_backend_synchronize(be);
-                }
-            }
-
-            auto startTime = std::chrono::high_resolution_clock::now();
-            rejoin_tensor(tensor, extra);
-            auto time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count();
-            total_rejoin_times[ggml_op_name(tensor->op)] += time;
-        }
-        #endif
-
-#if GGML_BACKEND_TP_VALIDATE
-        auto src0 = tensor->src[0];
-        char* original_data = NULL;
-        size_t original_size = 0;
-        ggml_tensor_parallel_extra * src0_extra = NULL;
-        if (false && src0 && src0->extra) {
-            src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
-            original_data = src0_extra->original_data;
-            original_size = src0_extra->original_size;
-        }
-        if (original_data) {
-            const int testindex = 1;
-
-            auto buffer = extra->tensors[testindex]->buffer;
-        
-            auto buft = buffer->buft->iface.alloc_buffer(buffer->buft, original_size);
-            ggml_tensor * test = ggml_backend_tp_clone_tensor(tensor->src[0]);
-            test->buffer = buft;
-            test->data = buft->iface.get_base(buft);
-            auto status = ggml_backend_buffer_init_tensor(buft, test);
-            if (status != GGML_STATUS_SUCCESS) {
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: init_tensor failed for tensor %s\n", tensor->name);
-            }
-            // set the tensor
-            buft->iface.set_tensor(buft, test, original_data, 0, original_size);
-            
-            for (auto be : ggml_parallel_backends) {
-                ggml_backend_synchronize(be);
-            }
-        
-            auto op = ggml_backend_tp_clone_tensor(tensor);
-            op->src[0] = test;
-            op->src[1] = ((ggml_tensor_parallel_extra *)tensor->src[1]->extra)->tensors[testindex];
-            auto buft2 = buffer->buft->iface.alloc_buffer(buffer->buft, ggml_nbytes(op));
-            op->buffer = buft2;
-            op->data = buft2->iface.get_base(buft2);
-            status = buft2->iface.init_tensor(buft2, op);
-            if (status != GGML_STATUS_SUCCESS) {
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: init_tensor failed for tensor %s\n", tensor->name);
-            }
-            
-            for (auto be : ggml_parallel_backends) {
-                ggml_backend_synchronize(be);
-            }
-        
-            // compute
-            auto be = ggml_parallel_backends[testindex];
-            status = be->iface.node_compute(be, op);
-            if (status != GGML_STATUS_SUCCESS) {
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: node_compute failed for tensor %s\n", tensor->name);
-            }
-            
-            for (auto be : ggml_parallel_backends) {
-                ggml_backend_synchronize(be);
-            }
-        
-            ensure_rejoined(tensor, tensor);
-            auto recombined_size = ggml_nbytes(tensor);
-            std::unique_ptr<char, decltype(&std::free)> data(
-                static_cast<char*>(std::malloc(recombined_size)), &std::free);
-            rejoin_tensor(tensor, extra);
-            read_tensor(extra->converted_tensors[0], data);
-
-            std::unique_ptr<char, decltype(&std::free)> data2(nullptr, &std::free);
-            read_tensor(op, data2);
-            auto r = memdiff_index(data.get(), data2.get(), ggml_nbytes(op));
-
-            buft->iface.free_buffer(buft);
-            buft2->iface.free_buffer(buft2);
-
-            delete test;
-            delete op;
-
-            if (r != -1) {
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-        
-                data2.reset((char *)malloc(ggml_nbytes(src0)));
-                // read it back
-                size_t offset = 0;
-                for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-                    auto wrapped = src0_extra->tensors[j];
-                    auto buft = wrapped->buffer;
-                    buft->iface.get_tensor(buft, wrapped, data2.get() + offset, 0, ggml_nbytes(wrapped));
-                    offset += ggml_nbytes(wrapped);
-                }    
-                for (auto be : ggml_parallel_backends) {
-                    ggml_backend_synchronize(be);
-                }
-                r = memdiff_index(data2.get(), src0_extra->original_data, ggml_nbytes(src0));
-                if (r != -1) {
-                    GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                }
-        
-                auto e = (ggml_tensor_parallel_extra *)tensor->src[1]->extra;
-                std::unique_ptr<char, decltype(&std::free)> t1(nullptr, &std::free);
-                std::unique_ptr<char, decltype(&std::free)> t2(nullptr, &std::free);
-        
-                read_tensor(e->tensors[0], t1);
-                read_tensor(e->tensors[1], t2);
-        
-                r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(e->tensors[0]));
-                if (r != -1) {
-                    GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                }
-            }
-        }
-
-
-        if (!extra->split_tensors || extra->has_rejoin) {
-            std::unique_ptr<char, decltype(&std::free)> t1(nullptr, &std::free);
-            std::unique_ptr<char, decltype(&std::free)> t2(nullptr, &std::free);
-            
-            read_tensor(extra->tensors[0], t1);
-            read_tensor(extra->tensors[1], t2);
-
-            auto fail = false;
-            auto r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(extra->tensors[0]));
-            if (extra->split_tensors && r == -1) {
-                // split tensors should be different.
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                // fail = true;
-            }
-            else if (!extra->split_tensors && r != -1) {
-                // non split tensors should be the same
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                fail = true;
-            }
-
-            if (extra->has_rejoin) {
-                read_tensor(extra->has_rejoin ? extra->converted_tensors[0] : extra->tensors[0], t1);
-                read_tensor(extra->has_rejoin ? extra->converted_tensors[1] : extra->tensors[1], t2);
-                r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(extra->tensors[0]));
-                if (r != -1) {
-                    GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                    fail = true;
-                }
-            }
-            if (fail) {
-                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-    
-                for (int i = 0; i < GGML_MAX_SRC; i++) {
-                    auto src = tensor->src[i];
-                    if (src) {
-                        auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-                        read_tensor(src_extra->has_rejoin ? src_extra->converted_tensors[0] : src_extra->tensors[0], t1);
-                        read_tensor(src_extra->has_rejoin ? src_extra->converted_tensors[1] : src_extra->tensors[1], t2);
-                        auto r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(src_extra->tensors[0]));
-                        if (r != -1) {
-                            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                        }
-                    }
-                }
-
-                std::vector<ggml_tensor *> srcs;
-                for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-                    auto wrapped = extra->tensors[j];
-                    auto be = ggml_parallel_backends[j];
-                    ggml_status status = be->iface.node_compute(be, wrapped);
-                    srcs.push_back(wrapped->src[0]);
-                    if (status != GGML_STATUS_SUCCESS) {
-                        return status;
-                    }
-                }
-
-                {
-                    read_tensor(srcs[0], t1);
-                    read_tensor(srcs[1], t2);
-                    auto r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(srcs[0]));
-                    if (r != -1) {
-                        GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                    }
-                }
-
-                // this split op needs to be recombined for the another op
-                if (extra->has_rejoin) {
-                    rejoin_tensor(tensor, extra);
-                }
-                
-                read_tensor(extra->has_rejoin ? extra->converted_tensors[0] : extra->tensors[0], t1);
-                read_tensor(extra->has_rejoin ? extra->converted_tensors[1] : extra->tensors[1], t2);
-                r = memdiff_index(t1.get(), t2.get(), ggml_nbytes(extra->tensors[0]));
-                if (r != -1) {
-                    GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: data mismatch for tensor %s\n", tensor->name);
-                }
-            }
-        }
-        else {
-            printf("Tensor %s is not split\n", ggml_op_name(tensor->op));
-        }
-#endif
-    }
-
-    for (auto & rejoin_time : total_rejoin_times) {
-        printf("Rejoin time for %s: %ld us\n", rejoin_time.first.c_str(), rejoin_time.second);
-    }
-
-    // printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
-    lastStartTime = std::chrono::high_resolution_clock::now();
-
-    return GGML_STATUS_SUCCESS;
 
     GGML_UNUSED(backend);
 }
@@ -1287,7 +945,7 @@ static void ggml_backend_tp_get_tensor_async(ggml_backend_t backend, const ggml_
 
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
-    ensure_rejoined(tensor, tensor);
+    ensure_rejoined(nullptr, tensor);
     if (extra->split_tensors) {
         rejoin_tensor_data(tensor, extra, (char * )data);
         return;
@@ -1486,12 +1144,12 @@ static ggml_split get_alloc_splits(size_t size) {
     return splits;
 }
 
-static void ensure_weight_column_split(ggml_tensor * tensor) {
-    if (tensor->op != GGML_OP_NONE) {
+static void ensure_weight_column_split(ggml_tensor * weight, ggml_tensor * mulmat) {
+    if (weight->op != GGML_OP_NONE) {
         return;
     }
 
-    auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+    auto extra = (ggml_tensor_parallel_extra *)weight->extra;
     if (!extra->split_tensors) {
         return;
     }
@@ -1501,7 +1159,8 @@ static void ensure_weight_column_split(ggml_tensor * tensor) {
     }
     extra->weight_column_split = true;
 
-    auto size = ggml_nbytes(tensor);
+    // the weight tensor is currently split by rows, reassemble it
+    auto size = ggml_nbytes(weight);
     std::unique_ptr<char, decltype(&std::free)> data(
         static_cast<char*>(std::malloc(size)), &std::free);
     size_t offset = 0;
@@ -1513,25 +1172,39 @@ static void ensure_weight_column_split(ggml_tensor * tensor) {
         offset += ggml_nbytes(wrapped);
     }
 
-
-    auto block_size = ggml_blck_size(tensor->type);
-    auto blocks_per_row = tensor->ne[0] / block_size;
-    auto elements_per_block = tensor->ne[0] / blocks_per_row;
+    // now split on columns
+    auto block_size = ggml_blck_size(weight->type);
+    auto blocks_per_row = weight->ne[0] / block_size;
+    auto elements_per_block = weight->ne[0] / blocks_per_row;
     auto splits = get_dim_splits(blocks_per_row);
 
     offset = 0;
     for (int j = 0; j < ggml_parallel_devices.size(); j++) {
         auto wrapped = extra->tensors[j];
         wrapped->ne[0] = splits.split[j] * elements_per_block;
-        wrapped->ne[1] = tensor->ne[1];
+        wrapped->ne[1] = weight->ne[1];
         wrapped->nb[1] = wrapped->nb[0] * (wrapped->ne[0] / ggml_blck_size(wrapped->type));
         wrapped->nb[2] = wrapped->nb[1] * wrapped->ne[1];
         wrapped->nb[3] = wrapped->nb[2] * wrapped->ne[2];
+
+        std::unique_ptr<char, decltype(&std::free)> slice(
+            static_cast<char*>(std::malloc(wrapped->nb[3])), &std::free);
+
+        // todo: add cpy2d to the backend interface to remove this hackery
+        // this is slow as hell during load.
+
+        // blit from the full memory to a split memory
+        for (int i = 0; i < weight->ne[1]; i++) {
+            memcpy(slice.get() + i * wrapped->nb[1], data.get() + i * weight->nb[1] + offset, wrapped->nb[1]);
+        }
+
+        // set the tensor from the split memory
         auto buft = wrapped->buffer;
         auto buft_size = ggml_nbytes(wrapped);
-        // this is wrong but whatever
-        buft->iface.set_tensor(buft, wrapped, data.get() + offset, 0, buft_size);
-        offset += buft_size;
+        buft->iface.set_tensor(buft, wrapped, slice.get(), 0, buft_size);
+        
+        // track the column offset
+        offset += wrapped->nb[1];
     }
 }
 
@@ -1605,9 +1278,8 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         // mulmat can handle the broadcast "A" tensor.
         if (split_from_src) {
             if (tensor->op == GGML_OP_MUL_MAT) {
-                if (true ) {
+                if (true) {
                     ensure_rejoined(tensor, tensor->src[1]);
-
                 }
                 else {
 
@@ -1620,16 +1292,40 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         return GGML_STATUS_FAILED;
                     }
 
-                    // if src1 is split, src0 must be a split weight.
-                    // however, split weights are split in the wrong direction, and
-                    // need to be re-split once.
-                    // if src0 is not a weight, rejoin src1 so it can be multiplied.
+                    // if src1 is split it can be used as is in the scenario where src0 is a split weight.
+                    // otherwise it needs to be rejoined.
+                    // however, the split weights are split in the wrong direction by the initial
+                    // set_tensor pass and needs to be rejoined and split correctly.
+                    // todo: llama.cpp should call init the on the entire tensor graph before calling
+                    // set_tensor on weights. that way a full understanding of the weight usage
+                    // can be used to determine how the weights should be split.
                     if (src1_extra->split_tensors) {
                         if (!ggml_backend_buft_is_tp_split(src0->buffer->buft)) {
+                            // if src0 is not a weight, rejoin src1 so it can be multiplied.
                             ensure_rejoined(tensor, tensor->src[1]);
                         }
                         else {
-                            ensure_weight_column_split(src0);
+                            ensure_weight_column_split(src0, tensor);
+                            // this mul mat needs to be sum reduced, and rejoining
+                            // will be on columns which is not ideal for memory layout.
+                            // temporarily adjust the tensor so flatten down to a single row
+                            // creating rejoins it into a sequential memory layout.
+                            // multiply by the number of devices to create enough space for the reduce.
+                            extra->split_tensors = true;
+                            auto original_ne1 = tensor->ne[1];
+                            tensor->ne[0] *= original_ne1 * ggml_parallel_devices.size();
+                            tensor->ne[1] = 1;
+                            tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(tensor->type));
+                            tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
+                            tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
+                            extra->original_ne1 = tensor->ne[1];
+                            extra->original_nb1 = tensor->nb[1];
+                            ensure_rejoined(nullptr, tensor);
+                            tensor->ne[0] /= (original_ne1 * ggml_parallel_devices.size());
+                            tensor->ne[1] = original_ne1;
+                            tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(tensor->type));
+                            tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
+                            tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
                         }
                     }
                 }
@@ -1850,7 +1546,7 @@ static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
         }
     }
 
-    ensure_rejoined(tensor, tensor);
+    ensure_rejoined(nullptr, tensor);
     rejoin_tensor(tensor, extra);
 
     if (extra->split_tensors) {
