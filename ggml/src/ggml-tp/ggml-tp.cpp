@@ -633,6 +633,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     auto startTime = std::chrono::high_resolution_clock::now();
     auto cgraph = thread->cgraph;
 
+    std::set<ggml_tensor*> pending_rejoins;
     int rejoins = 0;
     auto device_index = thread->device_index;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
@@ -643,7 +644,8 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         auto be = ggml_parallel_backends[device_index];
 
         // wait for async memcpy to finish if needed
-        if (extra->needs_src_rejoin) {
+        if (extra->needs_src_rejoin && pending_rejoins.size()) {
+            pending_rejoins.clear();
             rejoins++;
             thread->end = node_index;
             release_peers(thread);
@@ -677,6 +679,8 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         if (!extra->has_rejoin) {
             continue;
         }
+
+        pending_rejoins.insert(tensor);
 
         if (tensor->op == GGML_OP_MUL_MAT) {
             const auto src0 = tensor->src[0];
