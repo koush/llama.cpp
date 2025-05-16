@@ -21,6 +21,7 @@
 
 #define NUM_DEVICES 1
 #define USE_MUL_MAT_REDUCE 1
+// #define GGML_BACKEND_TP_VALIDATE 1
 
 static std::vector<ggml_backend_dev_t> ggml_parallel_devices;
 static std::vector<ggml_backend_t> ggml_parallel_backends;
@@ -38,12 +39,15 @@ static ggml_guid_t ggml_backend_tp_guid() {
 struct ggml_backend_tp_context {
 };
 
-#define TP_MAX_DEVICES 16
+#define TP_MAX_DEVICES 2
 
 struct ggml_tensor_parallel_extra {
     // these are the tensors that are on the parallel GPU, they may or may not be split.
+    // todo: because llama cpp does not provide the full graph up front, these tensors are
+    // fully allocated on each backend device.
     ggml_tensor * tensors[TP_MAX_DEVICES];
-    // flag for whether the tensors are split
+
+    // flag for whether the tensors are split. split tensors will have a full tensor in converted_tensors.
     bool split_tensors;
 
 #if GGML_BACKEND_TP_VALIDATE
@@ -52,6 +56,7 @@ struct ggml_tensor_parallel_extra {
 #endif
 
     // persist the split tensor memory layout for reshaped tensors
+    // todo: use the reference view to grab this information.
     int64_t original_ne1;
     size_t original_nb1;
 
@@ -59,6 +64,8 @@ struct ggml_tensor_parallel_extra {
     bool has_rejoin;
     // this tensor needs to be split for another op.
     bool has_split;
+    // this tensor needs to be reduced prior to use by another op.
+    bool has_reduce;
 
     // this tensor does not support split ops and has a src that needs to be rejoined.
     bool needs_src_rejoin;
@@ -71,15 +78,15 @@ struct ggml_tensor_parallel_extra {
 
     size_t rejoined_buft_offsets[TP_MAX_DEVICES];
 
-    // holds either split tensors or rejoined tensors depending on the owning tensor.
+    // holds either split tensor views or full rejoined tensors depending on the owning tensor.
     ggml_tensor * converted_tensors[TP_MAX_DEVICES];
 
     // when a tensor is rejoined, it gathers the data from all the devices.
     // each device will provide a view of their full data for other devices as copy destinations.
+    // these are only write views and do not have an allocation of their own.
     ggml_tensor * rejoined_tensor_views[TP_MAX_DEVICES][TP_MAX_DEVICES];
 
     bool weight_column_split;
-    bool has_reduce;
 
     ~ggml_tensor_parallel_extra() {
         if (rejoined_buffer) {
@@ -163,7 +170,11 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
 
-            if (extra->split_tensors) {
+
+            if (src_extra->has_reduce && src_extra->has_rejoin) {
+                wrapped->src[i] = src_extra->converted_tensors[j];
+            }
+            else if (extra->split_tensors) {
                 if (src_extra->split_tensors) {
                     wrapped->src[i] = src_extra->tensors[j];
                 }
@@ -180,23 +191,20 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
                 }
             }
 
-            // special case for matmul
+            // mul mat may get two split tensors. when src0 is a weight can be multiplied
+            // it multiplied as two split tensors and then sum reduced.
+            // otherwise, the src1 tensors need to be rejoined and then multiplied.
             if (i == 1 && tensor->op == GGML_OP_MUL_MAT) {
-                auto src1 = tensor->src[1];
-                auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
-                if (src1_extra->split_tensors) {
-                    wrapped->src[1] = src1_extra->converted_tensors[j];
+                if (src_extra->split_tensors && src_extra->has_rejoin) {
+                    wrapped->src[1] = src_extra->converted_tensors[j];
                 }
                 else {
-                    wrapped->src[1] = src1_extra->tensors[j];
-                }
-                if (!wrapped->src[i]) {
-                    wrapped->src[1] = src1_extra->tensors[j];
+                    wrapped->src[1] = src_extra->tensors[j];
                 }
             }
 
             if (!wrapped->src[i]) {
-                GGML_LOG_ERROR("Tensor %s is not split, but its source %s is split\n", tensor->name, src->name);
+                GGML_LOG_ERROR("Tensor %s unwrap failure.\n", tensor->name, src->name);
             }
         }
     }
@@ -506,6 +514,7 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
             auto view = ggml_backend_tp_clone_tensor(view_src);
             src_extra->rejoined_tensor_views[j][i] = view;
 
+            view->op = GGML_OP_NONE;
             view->view_src = rejoined;
             if (src_extra->has_reduce) {
                 // adjust the offset to the start of the last tensor
@@ -525,20 +534,21 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     return GGML_STATUS_SUCCESS;
 }
 
-static int memdiff_index(const char *a, const char *b, size_t length) {
+static int memdiff_index(const void *a, const void *b, size_t length) {
     for (size_t i = 0; i < length; ++i) {
-        if (a[i] != b[i]) {
+        if (((char*)a)[i] != ((char*)b)[i]) {
             return (int)i;  // return index of first difference
         }
     }
     return -1;  // no differences found
 }
 
-static void read_tensor(ggml_tensor *tensor, std::unique_ptr<char, decltype(&std::free)> & memory) {
+template<typename p>
+static void read_tensor(ggml_tensor *tensor, std::unique_ptr<p, decltype(&std::free)> & memory) {
     auto tensor_size = ggml_nbytes(tensor);
     auto buffer = tensor->buffer;
 
-    memory.reset((char *) malloc(tensor_size));
+    memory.reset((p*) malloc(tensor_size));
 
     buffer->iface.get_tensor(buffer, tensor, memory.get(), 0, tensor_size);
 }
@@ -646,17 +656,92 @@ static void release_peers(struct compute_thread * thread) {
     }
 }
 
-static void reduce_joined_tensors(ggml_tensor * tensor) {
+static ggml_status reduce_joined_tensors(int device_index, const ggml_tensor * tensor ) {
     auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
     if (!extra->has_reduce) {
-        return;
+        return GGML_STATUS_SUCCESS;
     }
 
     if (!extra->has_rejoin) {
-        return;
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    auto be = ggml_parallel_backends[device_index];
+    ggml_tensor * wrapped = extra->tensors[device_index];
+
+    // ggml_parallel_backends[device_index]->iface.synchronize(ggml_parallel_backends[device_index]);
+    // std::unique_ptr<float, decltype(&std::free)> memory(nullptr, &std::free);
+    // read_tensor(extra->rejoined_tensor_views[device_index][0], memory);
+
+    // std::unique_ptr<float, decltype(&std::free)> memory3(nullptr, &std::free);
+    // read_tensor(extra->rejoined_tensor_views[device_index][1], memory3);
+
+
+    for (int last = ggml_parallel_devices.size(); last > 1; last /= 2) {
+        for (int i = 0; i < last; i += 2) {
+            auto src0 = extra->rejoined_tensor_views[device_index][i];
+            // std::unique_ptr<char, decltype(&std::free)> memory(nullptr, &std::free);
+            // read_tensor(src0, memory);
+            // std::unique_ptr<char, decltype(&std::free)> memory2(nullptr, &std::free);
+            // read_tensor(src0, memory2);
+            // auto r = memdiff_index(memory.get(), memory2.get(), ggml_nbytes(src0));
+            auto src1 = extra->rejoined_tensor_views[device_index][i + 1];
+            src0->op = GGML_OP_ADD;
+            src0->src[0] = src0;
+            src0->src[1] = src1;
+            auto status = be->iface.node_compute(be, src0);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
     }
 
-    int i = 0;
+    // ggml_parallel_backends[device_index]->iface.synchronize(ggml_parallel_backends[device_index]);
+    // std::unique_ptr<float, decltype(&std::free)> memory5(nullptr, &std::free);
+    // read_tensor(extra->rejoined_tensor_views[device_index][0], memory5);
+
+    // auto src0_extra = (ggml_tensor_parallel_extra *)tensor->src[0]->extra;
+
+    // auto src1 = tensor->src[1];
+    // auto src1_extra = (ggml_tensor_parallel_extra *)tensor->src[1]->extra;
+    // ensure_rejoined(nullptr, src1);
+    // auto realsrc1 = src1_extra->converted_tensors[device_index];
+    // auto buft2 = ggml_parallel_devices[device_index]->iface.get_buffer_type(ggml_parallel_devices[device_index]);
+    // auto bb2 = buft2->iface.alloc_buffer(buft2, ggml_nbytes(src1));
+    // realsrc1->buffer = bb2;
+    // realsrc1->data = bb2->iface.get_base(bb2);
+
+    // rejoin_tensor(src1, src1_extra);
+    // std::unique_ptr<float, decltype(&std::free)> memory4(nullptr, &std::free);
+    // read_tensor(src1_extra->converted_tensors[device_index], memory4);
+
+    // auto src0 = ggml_backend_tp_clone_tensor(tensor->src[0]);
+    // auto buft = ggml_parallel_devices[0]->iface.get_buffer_type(ggml_parallel_devices[device_index]);
+    // auto bb = buft->iface.alloc_buffer(buft, src0_extra->original_size);
+    // src0->buffer = bb;
+    // src0->data = bb->iface.get_base(bb);
+    // bb->iface.set_tensor(bb, src0, src0_extra->original_data, 0, src0_extra->original_size);
+
+    // ggml_tensor * op = ggml_backend_tp_clone_tensor(tensor);
+    // auto bb3 = buft->iface.alloc_buffer(buft, ggml_nbytes(op));
+    // op->buffer = bb3;
+    // op->data = bb3->iface.get_base(bb3);
+    // op->src[0] = src0;
+    // op->src[1] = realsrc1;
+
+    // // compute it
+    // ggml_parallel_backends[device_index]->iface.synchronize(ggml_parallel_backends[device_index]);
+    // auto status = be->iface.node_compute(be, op);
+
+    // // copy it back
+    // ggml_parallel_backends[device_index]->iface.synchronize(ggml_parallel_backends[device_index]);
+    // std::unique_ptr<float, decltype(&std::free)> check(nullptr, &std::free);
+    // read_tensor(op, check);
+
+
+    // auto r = memdiff_index(memory.get(), check.get(), ggml_nbytes(extra->rejoined_tensor_views[device_index][0]));
+
+    return GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thread) {
@@ -707,7 +792,13 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
                     break;
                 }
 
-                reduce_joined_tensors(src);
+                auto status = reduce_joined_tensors(device_index, src);
+                if (status != GGML_STATUS_SUCCESS) {
+                    thread->end = status;
+                    release_peers(thread);
+                    thread->done.unlock();
+                    return;
+                }
             }
         }
 
@@ -1317,11 +1408,21 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
                 // a pending reduce can be fused with subsequent adds.
                 if (src_extra->has_reduce) {
-                    if (tensor->op != GGML_OP_ADD) {
-                        ensure_rejoined(tensor, src);
-                        continue;
-                    }
-                    extra->has_reduce = true;
+                    ensure_rejoined(tensor, src);
+                    continue;
+
+                    // all reduce by add is maybe possible?
+                    // a XxM x MxY mul mat results in 2 XxY matricies that need
+                    // to be summed. ie if matrix 1 and 2 are to be summed,
+                    // and 1 needs a reduce, and 2 does not need a reduce but is split,
+                    // then owned split of B can be added to A which will later be reduced
+                    // for the full sum.
+
+                    // if (tensor->op != GGML_OP_ADD) {
+                    //     ensure_rejoined(tensor, src);
+                    //     continue;
+                    // }
+                    // extra->has_reduce = true;
                 }
                 split = true;
                 split_from_src = true;
@@ -1362,7 +1463,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         else {
                             ensure_weight_column_split(src0, tensor);
                             extra->has_reduce = true;
-
                         }
                     }
                 }
