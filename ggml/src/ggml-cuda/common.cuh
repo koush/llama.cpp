@@ -763,6 +763,7 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     std::unique_ptr<ggml_cuda_graph> cuda_graph;
+    std::vector<ggml_cuda_graph *> cuda_graphs;
 
     explicit ggml_backend_cuda_context(int device) :
         device(device),
@@ -781,6 +782,13 @@ struct ggml_backend_cuda_context {
             }
             if (cublas_handles[i] != nullptr) {
                 CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+            }
+        }
+        while (!cuda_graphs.empty()) {
+            auto graph = cuda_graphs.back();
+            cuda_graphs.pop_back();
+            if (graph != nullptr) {
+                delete graph;
             }
         }
     }
