@@ -779,46 +779,28 @@ static ggml_status ggml_backend_tp_node_compute_split(int device_index, ggml_ten
     auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
     auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
 
-    // auto reduce = src0_extra->has_reduce ? src0_extra->tensors[device_index] : src1_extra->tensors[device_index];
+    auto reduce = src0_extra->has_reduce ? src0_extra->tensors[device_index] : src1_extra->tensors[device_index];
     auto reduce_extra = src0_extra->has_reduce ? src0_extra : src1_extra;
-    // auto add = src0_extra->has_reduce ? src1_extra->tensors[device_index] : src0_extra->tensors[device_index];
+    auto add = src0_extra->has_reduce ? src1_extra->tensors[device_index] : src0_extra->tensors[device_index];
+    auto add_extra = src0_extra->has_reduce ? src1_extra : src0_extra;
 
-    // auto add_extra = src0_extra->has_reduce ? src1_extra : src0_extra;
-    // if (add_extra->has_rejoin) {
-    //     ggml_status status = be->iface.node_compute(be, wrapped);
-    //     return status;
-    // }
-
-    // auto dst = extra->rejoined_tensor_views[device_index][device_index];
-    // if (!dst) {
-    //     dst = wrapped;
-    // }
-
-
-    be->iface.cpy_tensor_async(be, be, reduce_extra->tensors[device_index], wrapped);
-    ggml_parallel_backends[device_index]->iface.synchronize(ggml_parallel_backends[device_index]);
-
+    // only columnwise split of the tensor is added, so copy the full tensor into place to ensure the unmodified data is present too.
+    if (reduce_extra->tensors[device_index]->data != wrapped->data) {
+        be->iface.cpy_tensor_async(be, be, reduce_extra->tensors[device_index], wrapped);
+    }
 
     // when an add is performed on a src that needs to be reduced, the dimensions will be mismatched:
     // reduced tensor: 8192x2
     // add tensor: 4096x2
     // the reduced tensor must get a column split view
     auto reduce_op_tensor = extra->reduce_op_tensors[device_index];
-    // reduce_op_tensor->data = dst->data + reduce_op_tensor->view_offs;
-
-    // std::unique_ptr<float, decltype(&std::free)> check2(nullptr, &std::free);
-    // read_tensor(reduce_extra->tensors[device_index], check2);
-
+    if (add_extra->has_split) {
+        reduce_op_tensor->src[1] = add_extra->converted_tensors[device_index];
+    }
+    else if (add_extra->has_rejoin) {
+        reduce_op_tensor->src[1] = add_extra->rejoined_tensor_views[device_index][device_index];
+    }
     ggml_status status = be->iface.node_compute(be, reduce_op_tensor);
-
-    // ggml_parallel_backends[device_index]->iface.synchronize(ggml_parallel_backends[device_index]);
-    // std::unique_ptr<float, decltype(&std::free)> check(nullptr, &std::free);
-    // read_tensor(wrapped, check);
-
-    // auto r = memdiff_index(check2.get(), check.get(), ggml_nbytes(wrapped));
-    // auto r2 = memdiff_index((char *)check2.get() + wrapped->nb[1] / 4, (char *)check.get() + wrapped->nb[1] / 4, ggml_nbytes(wrapped) / 2);
-    // auto r3 = memdiff_index((char *)check2.get() + wrapped->nb[1] / 2, (char *)check.get() + wrapped->nb[1] / 2, ggml_nbytes(wrapped) / 2);
-
     return status;
 }
 
@@ -842,7 +824,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
         // wait for async memcpy to finish if needed
         if (extra->needs_src_rejoin && pending_rejoins.size()) {
-            pending_rejoins.clear();
             rejoins++;
             thread->end = node_index;
             release_peers(thread);
@@ -864,20 +845,11 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             }
             ggml_backend_tp_semaphore_acquire(&thread->semaphore);
 
-            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
-                auto src = tensor->src[i];
-                if (!src) {
-                    break;
-                }
-
-                auto status = reduce_joined_tensors(device_index, src);
-                if (status != GGML_STATUS_SUCCESS) {
-                    thread->end = status;
-                    release_peers(thread);
-                    thread->done.unlock();
-                    return;
-                }
+            for (auto & pending : pending_rejoins) {
+                reduce_joined_tensors(device_index, pending);
             }
+            pending_rejoins.clear();
+
         }
 
         ggml_status status = ggml_backend_tp_node_compute_split(device_index, tensor);
@@ -1478,9 +1450,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
                 // a pending reduce can be fused with subsequent adds.
                 if (src_extra->has_reduce) {
-                    ensure_rejoined(tensor, src);
-                    continue;
-
                     // all reduce by add is maybe possible?
                     // a split XxM x MxY mul mat results in 2 XxY matricies that need
                     // to be summed/reduced.
@@ -1499,6 +1468,27 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 break;
             }
         }
+
+        if (tensor->op == GGML_OP_ADD && extra->has_reduce) {
+            auto src0 = tensor->src[0];
+            auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
+            auto src1 = tensor->src[1];
+            // auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
+            auto reduce = src0_extra->has_reduce ? src0 : src1;
+            auto add = src0_extra->has_reduce ? src1 : src0;
+            auto add_extra = (ggml_tensor_parallel_extra *)add->extra;
+            if (!add_extra->split_tensors) {
+                ensure_split(add);
+            }
+            if (add_extra->has_rejoin) {
+                // why is this problematic? allowing this causes corruption
+                ensure_rejoined(tensor, reduce);
+                extra->has_reduce = false;
+                split = false;
+                split_from_src = false;
+            }
+        }
+
 
         // everything but mul mat needs to be split as well.
         // mulmat can handle the broadcast "A" tensor.
