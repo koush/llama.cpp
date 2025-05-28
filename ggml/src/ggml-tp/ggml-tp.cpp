@@ -288,8 +288,8 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-        // case GGML_OP_RESHAPE:
-        // case GGML_OP_PERMUTE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
         // case GGML_OP_ROPE:
         // case GGML_OP_CPY:
             return true;
@@ -1620,7 +1620,14 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         if (src_cols > wrapped->ne[0]) {
                             auto original_ne1 = wrapped->ne[1];
                             wrapped->ne[1] = src_cols / wrapped->ne[0];
-                            wrapped->ne[2] = wrapped->ne[2] * original_ne1 / wrapped->ne[1];
+                            if (wrapped->ne[1] > original_ne1) {
+                                wrapped->ne[2] = wrapped->ne[1] / original_ne1;
+                                wrapped->ne[1] = original_ne1;
+                            }
+                            else {
+                                wrapped->ne[2] = 1;
+                            }
+                            wrapped->ne[3] = 1;
                         }
                         else {
                             auto original_ne0 = wrapped->ne[0];
