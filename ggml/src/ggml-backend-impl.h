@@ -115,6 +115,9 @@ extern "C" {
         // wait for an event on on a different stream
         void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
 
+        // width, height, stride are in bytes, not elements
+        void (*set_tensor2d_async)(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t width, size_t height, size_t stride);
+
         // compute node (always async if supported by the backend)
         enum ggml_status          (*node_compute)     (ggml_backend_t backend, struct ggml_tensor *node);
     };
