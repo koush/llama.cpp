@@ -792,35 +792,13 @@ static ggml_status ggml_backend_tp_node_compute_split(int device_index, ggml_ten
     auto be = ggml_parallel_backends[device_index];
     auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
     auto wrapped = extra->tensors[device_index];
-    if (tensor->op != GGML_OP_ADD || !extra->has_reduce || !extra->has_reduce) {
+    if (tensor->op != GGML_OP_ADD || !extra->has_reduce) {
         ggml_status status = be->iface.node_compute(be, wrapped);
         return status;
     }
 
-    auto src0 = tensor->src[0];
-    auto src1 = tensor->src[1];
-    auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
-    auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
-
-    auto reduce = src0_extra->has_reduce ? src0_extra->tensors[device_index] : src1_extra->tensors[device_index];
-    auto reduce_extra = src0_extra->has_reduce ? src0_extra : src1_extra;
-    auto add = src0_extra->has_reduce ? src1_extra->tensors[device_index] : src0_extra->tensors[device_index];
-    auto add_extra = src0_extra->has_reduce ? src1_extra : src0_extra;
-
-    // only columnwise split of the tensor is added, so copy the full tensor into place to ensure the unmodified data is present too.
-    if (reduce_extra->tensors[device_index]->data != wrapped->data) {
-        be->iface.cpy_tensor_async(be, be, reduce_extra->tensors[device_index], wrapped);
-    }
-
     auto reduce_op_tensor = extra->reduce_op_tensors[device_index];
-    if (!reduce_op_tensor->src[0]->buffer) {
-        reduce_op_tensor->src[0]->buffer = reduce_op_tensor->src[0]->view_src->buffer;
-        reduce_op_tensor->src[0]->data = reduce_op_tensor->src[0]->view_src->data + reduce_op_tensor->src[0]->view_offs;
-    }
-    if (!reduce_op_tensor->src[1]->buffer) {
-        reduce_op_tensor->src[1]->buffer = reduce_op_tensor->src[1]->view_src->buffer;
-        reduce_op_tensor->src[1]->data = reduce_op_tensor->src[1]->view_src->data + reduce_op_tensor->src[1]->view_offs;
-    }
+
     ggml_status status = be->iface.node_compute(be, reduce_op_tensor);
     return status;
 }
@@ -938,7 +916,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     release_peers(thread);
     thread->done.unlock();
 
-    // printf("TP graph %d compute time: %ld us %d rejoins\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count(), rejoins);
+    printf("TP graph %d compute time: %ld us %d rejoins\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count(), rejoins);
 }
 
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -1578,6 +1556,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
 
         bool can_reduce = (src0_extra->has_reduce && !src0_extra->has_rejoin) || (src1_extra->has_reduce && !src1_extra->has_rejoin);
+        bool double_reduce = src0_extra->has_reduce && src1_extra->has_reduce;
         if (can_reduce) {
             ensure_split(src0);
             ensure_split(src1);
