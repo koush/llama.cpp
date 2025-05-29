@@ -219,7 +219,7 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
             }
 
             if (i == 1 && tensor->op == GGML_OP_ROPE) {
-                wrapped->src[1] = src_extra->tensors[j];
+                wrapped->src[i] = src_extra->tensors[j];
             }
             if (i > 0 && tensor->op == GGML_OP_FLASH_ATTN_EXT) {
                 wrapped->src[i] = src_extra->tensors[j];
@@ -776,7 +776,14 @@ static ggml_status ggml_backend_tp_node_compute_split(int device_index, ggml_ten
     }
 
     auto reduce_op_tensor = extra->reduce_op_tensors[device_index];
-
+    if (!reduce_op_tensor->src[0]->buffer) {
+        reduce_op_tensor->src[0]->buffer = reduce_op_tensor->src[0]->view_src->buffer;
+        reduce_op_tensor->src[0]->data = reduce_op_tensor->src[0]->view_src->data + reduce_op_tensor->src[0]->view_offs;
+    }
+    if (!reduce_op_tensor->src[1]->buffer) {
+        reduce_op_tensor->src[1]->buffer = reduce_op_tensor->src[1]->view_src->buffer;
+        reduce_op_tensor->src[1]->data = reduce_op_tensor->src[1]->view_src->data + reduce_op_tensor->src[1]->view_offs;
+    }
     ggml_status status = be->iface.node_compute(be, reduce_op_tensor);
     return status;
 }
@@ -1465,42 +1472,17 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             }
             if (ggml_backend_tp_is_split(src)) {
                 auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-                // a pending reduce can be fused with subsequent adds.
-                if (src_extra->has_reduce) {
-                    if (tensor->op != GGML_OP_ADD) {
-                        ensure_rejoined(tensor, src);
-                        continue;
-                    }
-                    extra->has_reduce = true;
-                    split_reduced_add = true;
+                // unless this is an add op, a tensor in a reduced state
+                // does not count as a split tensor. it will require a rejoin.
+                if (src_extra->has_reduce && tensor->op != GGML_OP_ADD) {
+                    ensure_rejoined(tensor, src);
+                    continue;
                 }
                 split = true;
                 split_from_src = true;
                 break;
             }
         }
-
-        if (tensor->op == GGML_OP_ADD && extra->has_reduce) {
-            auto src0 = tensor->src[0];
-            auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
-            auto src1 = tensor->src[1];
-            // auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
-            auto reduce = src0_extra->has_reduce ? src0 : src1;
-            auto add = src0_extra->has_reduce ? src1 : src0;
-            auto add_extra = (ggml_tensor_parallel_extra *)add->extra;
-            if (!add_extra->split_tensors) {
-                ensure_split(add);
-            }
-            if (add_extra->has_rejoin) {
-                // printf("ggml_backend_tp_buffer_init_tensor: tensor %s has a pending reduce, rejoining src %s\n", tensor->name, add->name);
-                // why is this problematic? allowing this causes corruption
-                ensure_rejoined(tensor, reduce);
-                extra->has_reduce = false;
-                split = false;
-                split_from_src = false;
-            }
-        }
-
 
         // everything but mul mat needs to be split as well.
         // mulmat can handle the broadcast "A" tensor.
@@ -1552,34 +1534,55 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         }
     }
 
+    if (tensor->op == GGML_OP_ADD) {
+        bool can_reduce = false;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            auto src = tensor->src[i];
+            if (!src) {
+                break;
+            }
+            auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+            if (src_extra->has_reduce) {
+                can_reduce = true;
+                break;
+            }
+        }
+
+        if (can_reduce) {
+            auto src0 = tensor->src[0];
+            auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
+            auto src1 = tensor->src[1];
+            // auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
+            auto reduce = src0_extra->has_reduce ? src0 : src1;
+            auto add = src0_extra->has_reduce ? src1 : src0;
+            auto add_extra = (ggml_tensor_parallel_extra *)add->extra;
+
+            if (add_extra->has_rejoin) {
+                // printf("ggml_backend_tp_buffer_init_tensor: tensor %s has a pending reduce, rejoining src %s\n", tensor->name, add->name);
+                // why is this problematic? allowing this causes corruption
+                ensure_rejoined(tensor, reduce);
+                extra->has_reduce = false;
+                split = false;
+                split_from_src = false;
+            }
+            else {
+                if (!add_extra->split_tensors) {
+                    ensure_split(add);
+                }
+                extra->has_reduce = true;
+                split_reduced_add = true;
+                for (int i = 0; i < GGML_MAX_SRC; i++) {
+                    auto src = tensor->src[i];
+                    if (!src) {
+                        break;
+                    }
+                    ensure_split(src);
+                }
+            }
+        }
+    }
+
     extra->split_tensors = split;
-
-    // if (tensor->op == GGML_OP_ADD) {
-    //     bool can_reduce = false;
-    //     for (int i = 0; i < GGML_MAX_SRC; i++) {
-    //         auto src = tensor->src[i];
-    //         if (!src) {
-    //             break;
-    //         }
-    //         auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-    //         if (src_extra->has_reduce) {
-    //             can_reduce = true;
-    //             break;
-    //         }
-    //     }
-
-    //     if (can_reduce) {
-    //         extra->has_reduce = true;
-    //         split_reduced_add = true;
-    //         for (int i = 0; i < GGML_MAX_SRC; i++) {
-    //             auto src = tensor->src[i];
-    //             if (!src) {
-    //                 break;
-    //             }
-    //             ensure_split(src);
-    //         }
-    //     }
-    // }
 
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         ggml_tensor * wrapped = ggml_backend_tp_clone_tensor(tensor);
@@ -1793,49 +1796,76 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         }
     }
 
+    // this is getting wonky. the src calc shoudl maybe be in unwrap tensor.
     if (split_reduced_add) {
         auto src0 = tensor->src[0];
         auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
         auto src1 = tensor->src[1];
-        auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
-        if (src0_extra->has_reduce && src1_extra->has_reduce) {
-            GGML_ABORT("ggml_backend_tp_buffer_init_tensor: tensor %s has two reduce tensors\n", tensor->name);
+
+        // one of these must be a reduce tensor, the other may be a split tensor, unsplit tensor, or even another reduce tensor.
+        auto reduce_tensor = src0_extra->has_reduce ? src0 : src1;
+        auto add_tensor = src0_extra->has_reduce ? src1 : src0;
+        auto add_extra = (ggml_tensor_parallel_extra *)add_tensor->extra;
+        auto reduce_extra = (ggml_tensor_parallel_extra *)reduce_tensor->extra;
+
+        if (add_extra->has_reduce && reduce_extra->has_reduce && add_extra->has_rejoin && reduce_extra->has_rejoin) {
+            // could fix this
+            GGML_ABORT("ggml_backend_tp_buffer_init_tensor: cannot have two reduce tensors with rejoin in an add op\n");
         }
 
-        auto splits = get_col_splits(tensor);
-        size_t col_offset = 0;
+        if (add_extra->has_reduce) {
+            // double reduce add can simply be added without any views.
+            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                auto wrapped = extra->tensors[j];
+                auto reduce_op = ggml_backend_tp_clone_tensor(wrapped);
+                extra->reduce_op_tensors[j] = reduce_op;
+                reduce_op->buffer = wrapped->buffer;
+                reduce_op->view_src = wrapped;
+                reduce_op->view_offs = 0;
+                reduce_op->data = wrapped->data;
 
-        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-            auto wrapped = extra->tensors[j];
+                reduce_op->src[0] = reduce_extra->has_rejoin ? reduce_extra->rejoined_tensor_views[j][j] : reduce_extra->tensors[j];
+                reduce_op->src[1] = add_extra->has_rejoin ? add_extra->rejoined_tensor_views[j][j] : add_extra->tensors[j];
+            }
+        }
+        else {
+            auto splits = get_col_splits(tensor);
+            size_t col_offset = 0;
 
-            // one of these must be a reduce tensor, the other may be a split tensor, unsplit tensor, or even another reduce tensor.
-            auto reduce = src0_extra->has_reduce ? src0_extra->tensors[j] : src1_extra->tensors[j];
+            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                auto wrapped = extra->tensors[j];
 
-            auto add_tensor = src0_extra->has_reduce ? src1 : src0;
-            auto add_extra = (ggml_tensor_parallel_extra *)add_tensor->extra;
-            auto add = add_extra->has_split ? add_extra->converted_tensors[j] : add_extra->tensors[j];
+                // create a col split view of the destination that can be used for reduction
+                auto reduce_op = ggml_backend_tp_clone_tensor(wrapped);
+                extra->reduce_op_tensors[j] = reduce_op;
+                reduce_op->buffer = wrapped->buffer;
+                reduce_op->view_src = wrapped;
+                reduce_op->view_offs = col_offset * wrapped->nb[0];
+                reduce_op->data = wrapped->data + reduce_op->view_offs;
+                reduce_op->ne[0] = splits.split[j];
 
-            // create a col split view of the reduced tensor
-            auto reduce_op_src_view = ggml_backend_tp_clone_tensor(reduce);
-            extra->reduce_op_src_views[j] = reduce_op_src_view;
-            reduce_op_src_view->buffer = reduce->buffer;
-            reduce_op_src_view->view_src = reduce;
-            reduce_op_src_view->view_offs = col_offset * reduce->nb[0];
-            reduce_op_src_view->data = reduce->data + reduce_op_src_view->view_offs;
-            reduce_op_src_view->ne[0] = splits.split[j];
+                // the reduce was rejoined, and the 
+                auto reduce = reduce_extra->tensors[j];
+                if (reduce_extra->has_rejoin) {
+                    reduce = reduce_extra->rejoined_tensor_views[j][j];
+                }
 
-            // create a col split view of the destination op
-            auto reduce_op = ggml_backend_tp_clone_tensor(wrapped);
-            extra->reduce_op_tensors[j] = reduce_op;
-            reduce_op->buffer = wrapped->buffer;
-            reduce_op->view_src = wrapped;
-            reduce_op->view_offs = col_offset * wrapped->nb[0];
-            reduce_op->data = wrapped->data + reduce_op->view_offs;
-            reduce_op->ne[0] = splits.split[j];
-            reduce_op->src[0] = reduce_op_src_view;
-            reduce_op->src[1] = add;
+                // create a col split view of the reduced tensor
+                auto reduce_op_src_view = ggml_backend_tp_clone_tensor(reduce);
+                extra->reduce_op_src_views[j] = reduce_op_src_view;
+                reduce_op_src_view->buffer = reduce->buffer;
+                reduce_op_src_view->view_src = reduce;
+                reduce_op_src_view->view_offs = col_offset * reduce->nb[0];
+                reduce_op_src_view->data = reduce->data + reduce_op_src_view->view_offs;
+                reduce_op_src_view->ne[0] = splits.split[j];
+                reduce_op->src[0] = reduce_op_src_view;
 
-            col_offset += splits.split[j];
+                auto add = add_extra->has_split ? add_extra->converted_tensors[j] : add_extra->tensors[j];
+                reduce_op->src[1] = add;
+
+                col_offset += splits.split[j];
+            }
+
         }
     }
 
