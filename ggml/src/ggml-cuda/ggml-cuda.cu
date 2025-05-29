@@ -2441,7 +2441,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *)buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *)buf_dst->context;
 
-    bool same_layout_and_contiguous = ggml_are_same_layout(src, dst) && ggml_is_contiguous(src) && !ggml_is_contiguous(dst);
+    bool same_layout_and_contiguous = ggml_are_same_layout(src, dst) && ggml_is_contiguous(src) && ggml_is_contiguous(dst);
 
     if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) {
 #ifndef NDEBUG
