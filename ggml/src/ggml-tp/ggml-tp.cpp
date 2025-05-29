@@ -551,6 +551,14 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     }
     src_extra->has_rejoin = true;
 
+    auto vs = src;
+    while (vs->view_src) {
+        vs = vs->view_src;
+    }
+    if (vs->ne[2] > 1 || vs->ne[3] > 1) {
+        GGML_ABORT("Tensor %s has more than 2 dimensions, not supported for TP.\n", src->name);
+    }
+
     // if (reason && reason != src) {
     //     printf("Rejoining tensor for %s %d %d\n", ggml_op_name(reason->op), src->ne[0], src->ne[1]);
     // }
@@ -835,10 +843,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             if (device_index == 0) {
                 for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
                     auto backend = ggml_parallel_backends[j];
-                    if (backend->iface.synchronize) {
-                        backend->iface.synchronize(backend);
-                    }
-                    backend->iface.synchronize(backend);
+                    ggml_backend_synchronize(backend);
                 }
                 release_peers(thread);
             }
@@ -852,8 +857,18 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             pending_rejoins.clear();
         }
 
+        // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        //     auto backend = ggml_parallel_backends[j];
+        //     ggml_backend_synchronize(backend);
+        // }
+
         ggml_status status = ggml_backend_tp_node_compute_split(device_index, tensor);
         extra->computed[device_index] = true;
+
+        // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        //     auto backend = ggml_parallel_backends[j];
+        //     ggml_backend_synchronize(backend);
+        // }
 
         if (status != GGML_STATUS_SUCCESS) {
             thread->end = status;
@@ -864,14 +879,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
         if (!extra->has_rejoin) {
             continue;
-        }
-
-        auto vs = tensor;
-        while (vs->view_src) {
-            vs = vs->view_src;
-        }
-        if (vs->ne[2] > 1 || vs->ne[3] > 1) {
-            GGML_ABORT("Tensor %s has more than 2 dimensions, not supported for TP.\n", tensor->name);
         }
 
         pending_rejoins.insert(tensor);
@@ -1674,7 +1681,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         wrapped->nb[1] = src_extra->tensors[j]->nb[1];
                         wrapped->nb[2] = src_extra->tensors[j]->nb[2];
                         wrapped->nb[3] = src_extra->tensors[j]->nb[3];
-                        ensure_rejoined(nullptr, tensor);
                     }
                     else if (tensor->op == GGML_OP_PERMUTE) {
                         auto src = tensor->src[0];
@@ -1706,7 +1712,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         wrapped->nb[1] = src_extra->tensors[j]->nb[1];
                         wrapped->nb[2] = src_extra->tensors[j]->nb[2];
                         wrapped->nb[3] = src_extra->tensors[j]->nb[3];
-                        ensure_rejoined(nullptr, tensor);
                     }
                     else {
                         if (!extra->has_reduce) {
