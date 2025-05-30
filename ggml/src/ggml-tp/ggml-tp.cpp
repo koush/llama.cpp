@@ -325,7 +325,7 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_DIV:
         case GGML_OP_RESHAPE:
         case GGML_OP_PERMUTE:
-        // case GGML_OP_ROPE:
+        case GGML_OP_ROPE:
         // case GGML_OP_FLASH_ATTN_EXT:
         // case GGML_OP_CPY:
             return true;
