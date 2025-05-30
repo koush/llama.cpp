@@ -216,7 +216,7 @@ void ggml_abort(const char * file, int line, const char * fmt, ...) {
     abort();
 }
 
-//lo
+//
 // logging
 //
 
