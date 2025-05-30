@@ -919,6 +919,10 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
         pending_rejoins.insert(tensor);
 
+        if (!be->iface.cpy_tensor2d_async) {
+            GGML_ABORT("Backend %s does not support async tensor copy.\n", be->iface.get_name(be));
+        }
+
         // async copies
         for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
             auto other_be = ggml_parallel_backends[other_device_index];
@@ -927,31 +931,15 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
                 break;
             }
 
-            if (!be->iface.cpy_tensor_async) {
-                continue;
-            }
-
             auto view_src = wrapped;
             while (view_src->view_src) {
                 view_src = view_src->view_src;
             }
-            if (!be->iface.cpy_tensor_async(be, other_be, view_src, rejoined_tensor_view)) {
-                ggml_backend_tensor_copy(view_src, rejoined_tensor_view);
+            if (!be->iface.cpy_tensor2d_async(be, other_be, view_src, rejoined_tensor_view)) {
+                GGML_ABORT("Failed to copy tensor %s from device %d to device %d\n", tensor->name, device_index, other_device_index);
+                // TODO, this is recoverable if something like this is implemented:
+                // ggml_backend_tensor2d_copy(view_src, rejoined_tensor_view);
             }
-        }
-
-        // sync copies
-        for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
-            auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
-            if (!rejoined_tensor_view) {
-                break;
-            }
-
-            if (be->iface.cpy_tensor_async) {
-                continue;
-            }
-
-            ggml_backend_tensor_copy(wrapped, rejoined_tensor_view);
         }
     }
 
