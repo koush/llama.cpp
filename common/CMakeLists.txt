@@ -58,21 +58,24 @@ add_library(${TARGET} STATIC
     arg.cpp
     arg.h
     base64.hpp
+    chat-parser.cpp
+    chat-parser.h
     chat.cpp
     chat.h
     common.cpp
     common.h
     console.cpp
     console.h
+    json-partial.cpp
+    json-partial.h
     json-schema-to-grammar.cpp
-    json.hpp
     llguidance.cpp
     log.cpp
     log.h
-    minja/chat-template.hpp
-    minja/minja.hpp
     ngram-cache.cpp
     ngram-cache.h
+    regex-partial.cpp
+    regex-partial.h
     sampling.cpp
     sampling.h
     speculative.cpp
@@ -119,8 +122,8 @@ if (LLAMA_LLGUIDANCE)
 
     ExternalProject_Add(llguidance_ext
         GIT_REPOSITORY https://github.com/guidance-ai/llguidance
-        # v0.7.19 (+ fancy-regex build fix):
-        GIT_TAG b59f98f85269892a7de3d3641ad155366f13daa6
+        # v0.7.20 (+ fix to build on GCC 15):
+        GIT_TAG b5b8b64dba11c4e4ee6b1d1450d3a3ae279891e8
         PREFIX ${CMAKE_BINARY_DIR}/llguidance
         SOURCE_DIR ${LLGUIDANCE_SRC}
         BUILD_IN_SOURCE TRUE
@@ -141,7 +144,7 @@ if (LLAMA_LLGUIDANCE)
     set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance ${LLGUIDANCE_PLATFORM_LIBS})
 endif ()
 
-target_include_directories(${TARGET} PUBLIC .)
+target_include_directories(${TARGET} PUBLIC . ../vendor)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
 
