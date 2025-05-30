@@ -2400,7 +2400,37 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *)tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
-static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+
+typedef struct ggml_2d_cpy {
+    size_t width;
+    size_t height;
+    size_t pitch;
+} ggml_2d_cpy_t;
+
+// maybe move to common
+static ggml_2d_cpy ggml_backend_cuda_2d_pitch(const ggml_tensor *src) {
+    size_t width;
+    size_t height;
+    size_t pitch = 0;
+    bool scontiguous[] = { ggml_is_contiguous(src),  ggml_is_contiguous_1(src), ggml_is_contiguous_2(src) };
+    for (int i = 0; i < 3; i++) {
+        if (!scontiguous[i]) {
+            if (pitch) {
+                return {};
+            }
+            pitch = src->nb[i + 1];
+            width = src->ne[i] * src->nb[i];
+            height = src->ne[i + 1];
+        }
+    }
+    // 1d contiguous
+    if (!pitch) {
+        return { src->nb[3], 1, src->nb[3] };
+    }
+    return { width, height, pitch };
+}
+
+static bool ggml_backend_cuda_cpy_tensor2d_async_common(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst, bool force_1d) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
@@ -2448,36 +2478,83 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
-    if (backend_src != backend_dst) {
-        // copy on src stream
-        if (!src_is_cuda) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
-        } else if (!dst_is_cuda) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToHost, cuda_ctx_src->stream()));
-        } else if (cuda_ctx_src->device == cuda_ctx_dst->device) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-        } else {
+    bool is_1d = force_1d;
+    ggml_2d_cpy_t src_pitch;
+    ggml_2d_cpy_t dst_pitch;
+
+    if (!force_1d) {
+        src_pitch = ggml_backend_cuda_2d_pitch(src);
+        if (!src_pitch.pitch) {
+            GGML_LOG_DEBUG("%s: src tensor is not 2d\n", __func__);
+            return false;
+        }
+
+        dst_pitch = ggml_backend_cuda_2d_pitch(dst);
+        if (!dst_pitch.pitch) {
+            GGML_LOG_DEBUG("%s: dst tensor is not 2d\n", __func__);
+            return false;
+        }
+
+        // attempt a 1d copy if possible
+        bool src_is_1d = src_pitch.width == src_pitch.pitch;
+        bool dst_is_1d = dst_pitch.width == dst_pitch.pitch;
+        bool is_1d = src_is_1d && dst_is_1d;
+
+        if (!is_1d) {
+            // in case one is 1d and the other is not, collapse the dimensions to match
+            if (src_is_1d) {
+                src_pitch.width = dst_pitch.width;
+                src_pitch.height = dst_pitch.height;
+                src_pitch.pitch /= src_pitch.height;
+            }
+            else if (dst_is_1d) {
+                dst_pitch.width = src_pitch.width;
+                dst_pitch.height = src_pitch.height;
+                dst_pitch.pitch /= dst_pitch.height;
+            }
+        }
+
+    }
+
+    cudaMemcpyKind kind = cudaMemcpyDefault;
+
+    if (backend_src == backend_dst) {
+        kind = cudaMemcpyDeviceToDevice;     
+    }
+    else if (!src_is_cuda) {
+        kind = cudaMemcpyHostToDevice; // copy from host to device
+    } else if (!dst_is_cuda) {
+        kind = cudaMemcpyDeviceToHost; // copy from device to host
+    } else if (cuda_ctx_src->device == cuda_ctx_dst->device) {
+        kind = cudaMemcpyDeviceToDevice; // copy from device to device
+    }
+    else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+        if (is_1d) {
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+        } else {
+            CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(dst->data, cuda_ctx_dst->device, dst_pitch.pitch, src->data, cuda_ctx_src->device, src_pitch.pitch, src_pitch.width, src_pitch.height, cuda_ctx_src->stream()));
+        }
 #endif
-        }
-
-        if (cuda_ctx_src) {
-            if (!cuda_ctx_src->copy_event) {
-                ggml_cuda_set_device(cuda_ctx_src->device);
-                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
-            }
-
-            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
-        }
-    } else {
-        // src and dst are on the same backend
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
+
+    if (kind != cudaMemcpyDefault) {
+        if (is_1d) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), kind, cuda_ctx_src->stream()));
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(dst->data, dst_pitch.pitch, src->data, src_pitch.pitch, src_pitch.width, src_pitch.height, kind, cuda_ctx_src->stream()));
+        }
+    }
+
     return true;
 }
+
+static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    return ggml_backend_cuda_cpy_tensor2d_async_common(backend_src, backend_dst, src, dst, true);
+}
+
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
@@ -2825,6 +2902,39 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+static void ggml_backend_cuda_set_tensor2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t width, size_t height, size_t stride) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    CUDA_CHECK(cudaMemcpy2DAsync(tensor->data, tensor->nb[1], data, stride, width, height, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+
+static enum ggml_status ggml_backend_cuda_node_compute(ggml_backend_t backend, ggml_tensor* node) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+#ifdef USE_CUDA_GRAPH
+    // Objects required for CUDA Graph
+    if (cuda_ctx->cuda_graph == nullptr) {
+        cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
+    }
+    cuda_ctx->cuda_graph->use_cpy_indirection = false;
+#endif
+
+    bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+    if (!ok) {
+        GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+    }
+    GGML_ASSERT(ok);
+    return GGML_STATUS_SUCCESS;
+}
+
+static bool ggml_backend_cuda_cpy_tensor2d_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    return ggml_backend_cuda_cpy_tensor2d_async_common(backend_src, backend_dst, src, dst, false);
+}
+
 static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_get_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -2839,6 +2949,10 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
+    /* .set_tensor2d_async      = */ ggml_backend_cuda_set_tensor2d_async,
+    /* .get_tensor2d_async      = */ NULL,
+    /* .cpy_tensor2d_async      = */ ggml_backend_cuda_cpy_tensor2d_async,
+    /* .node_compute            = */ ggml_backend_cuda_node_compute,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

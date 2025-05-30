@@ -115,8 +115,15 @@ extern "C" {
         // wait for an event on on a different stream
         void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
 
-        // width, height, stride are in bytes, not elements
+        // (optional) asynchronous 2d tensor data access. useful for interleaved reads/writes when gathering for tensor parallel backend.
+        // width, height, stride are in bytes, not elements.
         void (*set_tensor2d_async)(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t width, size_t height, size_t stride);
+        void (*get_tensor2d_async)(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
+        // cpy_tensor2d_async should handle 2d memcpy regardless of actual tensor layout. ie, if column and row is contiguous, but
+        // sequence is present and batch is 1. this can be handled by a 2d memcpy by collapsing columns and rows into a single dimension
+        // before calling the underlying 2d memcpy implementation.
+        // TODO: add ggml 4d memcpy wrapper that uses 2d memcpy if available.
+        bool (*cpy_tensor2d_async)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
         // compute node (always async if supported by the backend)
         enum ggml_status          (*node_compute)     (ggml_backend_t backend, struct ggml_tensor *node);
