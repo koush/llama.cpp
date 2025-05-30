@@ -2407,25 +2407,61 @@ typedef struct ggml_2d_cpy {
     size_t pitch;
 } ggml_2d_cpy_t;
 
+
+static bool ggml_is_contiguous_2d(const struct ggml_tensor * tensor, int n) {
+    size_t next_nb = ggml_type_size(tensor->type);
+    if (tensor->ne[0] != ggml_blck_size(tensor->type) && tensor->nb[0] != next_nb) {
+        return false;
+    }
+    next_nb *= tensor->ne[0]/ggml_blck_size(tensor->type);
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        if (tensor->ne[i] != 1) {
+            if (i > n) {
+                if (tensor->nb[i] != next_nb) {
+                    return false;
+                }
+                next_nb *= tensor->ne[i];
+            } else {
+                // this dimension does not need to be contiguous
+                next_nb = tensor->ne[i]*tensor->nb[i];
+            }
+        }
+    }
+    return true;
+}
+
 // maybe move to common
-static ggml_2d_cpy ggml_backend_cuda_2d_pitch(const ggml_tensor *src) {
+static ggml_2d_cpy ggml_backend_cuda_2d_pitch(const ggml_tensor *tensor) {
     size_t width;
     size_t height;
     size_t pitch = 0;
-    bool scontiguous[] = { ggml_is_contiguous(src),  ggml_is_contiguous_1(src), ggml_is_contiguous_2(src) };
-    for (int i = 0; i < 3; i++) {
-        if (!scontiguous[i]) {
+
+    // when verifying 2 dimensionality, allow for 1 noncontiguous dimension, which is the pitch
+    size_t next_nb = ggml_type_size(tensor->type);
+    if (tensor->ne[0] != ggml_blck_size(tensor->type) && tensor->nb[0] != next_nb) {
+        // no support for quantized types though it is possible.
+        return {};
+    }
+    next_nb *= tensor->ne[0]/ggml_blck_size(tensor->type);
+
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        if (tensor->nb[i] != next_nb) {
             if (pitch) {
                 return {};
             }
-            pitch = src->nb[i + 1];
-            width = src->ne[i] * src->nb[i];
-            height = src->ne[i + 1];
+            pitch = tensor->nb[i];
+            width = tensor->ne[i - 1] * tensor->nb[i - 1];
+            height = tensor->ne[i];
+
+            next_nb = tensor->nb[i];
         }
+
+        next_nb *= tensor->ne[i];
+        int f =0;
     }
     // 1d contiguous
     if (!pitch) {
-        return { src->nb[3], 1, src->nb[3] };
+        return { tensor->nb[3], 1, tensor->nb[3] };
     }
     return { width, height, pitch };
 }
