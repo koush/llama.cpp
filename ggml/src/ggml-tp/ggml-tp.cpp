@@ -576,7 +576,6 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     while (view_src->view_src) {
         view_src = view_src->view_src;
     }
-    auto splits = get_col_splits(view_src);
 
     if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -602,7 +601,24 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
         }
     }
     else if (src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
-        // GGML_ABORT("Row split tensors are not supported in TP backend, only column split tensors are supported.");
+        auto splits = get_row_splits(view_src);
+        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+            auto rejoined = src_extra->converted_tensors[j];
+
+            size_t row_offset = 0;
+            for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
+                auto view = ggml_backend_tp_clone_tensor(view_src);
+                src_extra->rejoined_tensor_views[j][i] = view;
+
+                view->op = GGML_OP_NONE;
+                view->view_src = rejoined;
+                view->ne[1] = splits.split[i];
+                // adjust the offset to the start of the row in the destination tensor
+                view->view_offs = view_src->nb[1] * row_offset;
+
+                row_offset += splits.split[j];
+            }
+        }
     }
     else {
         // a typical tensor that is split across multiple devices is usually column split.
@@ -614,12 +630,8 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
         // A A B B C C D D
         // A A B B C C D D
         // A A B B C C D D
+        auto splits = get_col_splits(view_src);
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-            auto dev = ggml_parallel_devices[j];
-            auto buffer_type = dev->iface.get_buffer_type(dev);
-            auto tensor_size = buffer_type->iface.get_alloc_size(buffer_type, src);
-            auto aligned_size = ggml_align_size(tensor_size, alignment);
-
             auto rejoined = src_extra->converted_tensors[j];
 
             size_t col_offset = 0;
