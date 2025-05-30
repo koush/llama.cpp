@@ -2408,28 +2408,6 @@ typedef struct ggml_2d_cpy {
 } ggml_2d_cpy_t;
 
 
-static bool ggml_is_contiguous_2d(const struct ggml_tensor * tensor, int n) {
-    size_t next_nb = ggml_type_size(tensor->type);
-    if (tensor->ne[0] != ggml_blck_size(tensor->type) && tensor->nb[0] != next_nb) {
-        return false;
-    }
-    next_nb *= tensor->ne[0]/ggml_blck_size(tensor->type);
-    for (int i = 1; i < GGML_MAX_DIMS; i++) {
-        if (tensor->ne[i] != 1) {
-            if (i > n) {
-                if (tensor->nb[i] != next_nb) {
-                    return false;
-                }
-                next_nb *= tensor->ne[i];
-            } else {
-                // this dimension does not need to be contiguous
-                next_nb = tensor->ne[i]*tensor->nb[i];
-            }
-        }
-    }
-    return true;
-}
-
 // maybe move to common
 static ggml_2d_cpy ggml_backend_cuda_2d_pitch(const ggml_tensor *tensor) {
     size_t width;
@@ -2457,7 +2435,6 @@ static ggml_2d_cpy ggml_backend_cuda_2d_pitch(const ggml_tensor *tensor) {
         }
 
         next_nb *= tensor->ne[i];
-        int f =0;
     }
     // 1d contiguous
     if (!pitch) {
