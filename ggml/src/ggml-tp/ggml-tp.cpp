@@ -57,11 +57,6 @@ struct ggml_tensor_parallel_extra {
     size_t original_size;
 #endif
 
-    // persist the split tensor memory layout for reshaped tensors
-    // todo: use the reference view to grab this information.
-    int64_t original_ne1;
-    size_t original_nb1;
-
     // this tensor needs to be rejoined for another op.
     bool has_rejoin;
     // this tensor needs to be split for another op.
@@ -551,14 +546,6 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     }
     src_extra->has_rejoin = true;
 
-    auto vs = src;
-    while (vs->view_src) {
-        vs = vs->view_src;
-    }
-    if (vs->ne[2] > 1 || vs->ne[3] > 1) {
-        GGML_ABORT("Tensor %s has more than 2 dimensions, not supported for TP.\n", src->name);
-    }
-
     // if (reason && reason != src) {
     //     printf("Rejoining tensor for %s %d %d\n", ggml_op_name(reason->op), src->ne[0], src->ne[1]);
     // }
@@ -662,8 +649,12 @@ static void rejoin_tensor_data(const ggml_tensor * tensor, ggml_tensor_parallel_
         return;
     }
 
-    auto ne1 = extra->original_ne1 ? extra->original_ne1 : tensor->ne[1];
-    auto nb1 = extra->original_nb1 ? extra->original_nb1 : tensor->nb[1];
+    auto vs = tensor;
+    while (vs->view_src) {
+        vs = vs->view_src;
+    }
+    auto ne1 = vs->ne[1];
+    auto nb1 = vs->nb[1];
     auto split_nb1 = get_dim_splits(nb1);
 
     if (data && extra->rejoined_to_buffer && extra->rejoined_buffer) {
@@ -881,6 +872,16 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             continue;
         }
 
+        auto vs = tensor;
+        while (vs->view_src) {
+            vs = vs->view_src;
+        }
+        if ((vs->ne[2] > 1 || vs->ne[3] > 1)) {
+            if (!ggml_is_contiguous(vs)) {
+                GGML_ABORT("Tensor %s has more than 2 dimensions, not supported for TP.\n", tensor->name);
+            }
+        }
+
         pending_rejoins.insert(tensor);
 
         // async copies
@@ -923,7 +924,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     release_peers(thread);
     thread->done.unlock();
 
-    printf("TP graph %d compute time: %ld us %d rejoins\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count(), rejoins);
+    // printf("TP graph %d compute time: %ld us %d rejoins\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count(), rejoins);
 }
 
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -1540,8 +1541,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             else if (tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_PERMUTE) {
                 auto src0 = tensor->src[0];
                 auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
-                extra->original_ne1 = src0_extra->original_ne1 ? src0_extra->original_ne1 : src0->ne[1];
-                extra->original_nb1 = src0_extra->original_nb1 ? src0_extra->original_nb1 : src0->nb[1];
             }
             else if (tensor->op != GGML_OP_UNARY && tensor->op != GGML_OP_FLASH_ATTN_EXT && tensor->op != GGML_OP_ROPE) {
                 // printf("ggml_backend_tp_buffer_init_tensor: splitting tensor %s with op %s\n", tensor->name, ggml_op_name(tensor->op));
