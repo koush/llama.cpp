@@ -66,8 +66,6 @@ struct ggml_tensor_parallel_extra {
 
     // this tensor needs to be rejoined for another op.
     bool has_rejoin;
-    // this tensor needs to be split for another op.
-    bool has_split;
     // this tensor needs to be reduced prior to use by another op.
     bool has_reduce;
 
@@ -403,10 +401,9 @@ static ggml_status ensure_split(const ggml_tensor *src) {
         // this tensor is already split, so we don't need to do anything
         return GGML_STATUS_SUCCESS;
     }
-    if (src_extra->has_split) {
+    if (src_extra->converted_tensors[0]) {
         return GGML_STATUS_SUCCESS;
     }
-    src_extra->has_split = true;
 
     // no actual conversion needs to take place, the split tensors can be
     // created by using offsets within the original tensor.
@@ -583,43 +580,66 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     }
     auto splits = get_col_splits(view_src);
 
-    // a tensor that is split across 4 devices can not be concatenated memorywise (rowwise).
-    // rather, the tensors must be copied back in columnwise.
-    // a 4x4 tensor with 4 GPU holding 4x2 tensors each:
-    // A A B B C C D D
-    // A A B B C C D D
-    // A A B B C C D D
-    // A A B B C C D D
-    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        auto dev = ggml_parallel_devices[j];
-        auto buffer_type = dev->iface.get_buffer_type(dev);
-        auto tensor_size = buffer_type->iface.get_alloc_size(buffer_type, src);
-        auto aligned_size = ggml_align_size(tensor_size, alignment);
+    if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+            auto dev = ggml_parallel_devices[j];
+            auto buffer_type = dev->iface.get_buffer_type(dev);
+            auto tensor_size = buffer_type->iface.get_alloc_size(buffer_type, src);
+            auto aligned_size = ggml_align_size(tensor_size, alignment);
 
-        auto rejoined = src_extra->converted_tensors[j];
+            auto rejoined = src_extra->converted_tensors[j];
 
-        size_t reduce_offset = 0;
-        size_t col_offset = 0;
-        for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
-            auto view = ggml_backend_tp_clone_tensor(view_src);
-            src_extra->rejoined_tensor_views[j][i] = view;
+            size_t reduce_offset = 0;
+            for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
+                auto view = ggml_backend_tp_clone_tensor(view_src);
+                src_extra->rejoined_tensor_views[j][i] = view;
 
-            view->op = GGML_OP_NONE;
-            view->view_src = rejoined;
-            if (src_extra->has_reduce) {
+                view->op = GGML_OP_NONE;
+                view->view_src = rejoined;
                 // adjust the offset to the start of the last tensor
                 view->view_offs = reduce_offset;
+
+                reduce_offset += aligned_size;
             }
-            else {
+        }
+    }
+    else if (src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
+        // GGML_ABORT("Row split tensors are not supported in TP backend, only column split tensors are supported.");
+    }
+    else {
+        // a typical tensor that is split across multiple devices is usually column split.
+        // this is because the weight matrixes are transposed and row split, resulting in
+        // column split resilt. this can not be concatenated memorywise (rowwise).
+        // rather, the tensors must be copied back in columnwise.
+        // a 4x4 tensor with 4 GPU holding 4x2 tensors each:
+        // A A B B C C D D
+        // A A B B C C D D
+        // A A B B C C D D
+        // A A B B C C D D
+        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+            auto dev = ggml_parallel_devices[j];
+            auto buffer_type = dev->iface.get_buffer_type(dev);
+            auto tensor_size = buffer_type->iface.get_alloc_size(buffer_type, src);
+            auto aligned_size = ggml_align_size(tensor_size, alignment);
+
+            auto rejoined = src_extra->converted_tensors[j];
+
+            size_t col_offset = 0;
+            for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
+                auto view = ggml_backend_tp_clone_tensor(view_src);
+                src_extra->rejoined_tensor_views[j][i] = view;
+
+                view->op = GGML_OP_NONE;
+                view->view_src = rejoined;
                 view->ne[0] = splits.split[i];
                 // adjust the offset to the start of the column in the destination tensor
                 view->view_offs = view_src->nb[1] / view_src->ne[0] * col_offset;
-            }
 
-            col_offset += splits.split[j];
-            reduce_offset += aligned_size;
+                col_offset += splits.split[j];
+            }
         }
     }
+
 
     return GGML_STATUS_SUCCESS;
 }
@@ -1894,7 +1914,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 auto reduce_op_src_view = reduce_extra->reduce_split_views[j];
                 reduce_op->src[0] = reduce_op_src_view;
 
-                auto add = add_extra->has_split ? add_extra->converted_tensors[j] : add_extra->tensors[j];
+                auto add = add_extra->split_tensors == GGML_TP_SPLIT_NONE ? add_extra->converted_tensors[j] : add_extra->tensors[j];
                 reduce_op->src[1] = add;
 
                 col_offset += splits.split[j];
