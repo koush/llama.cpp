@@ -40,6 +40,13 @@ struct ggml_backend_tp_context {
 
 #define TP_MAX_DEVICES 2
 
+enum ggml_tp_split_type {
+    GGML_TP_SPLIT_NONE = 0,
+    GGML_TP_SPLIT_ROWS = 1,
+    GGML_TP_SPLIT_COLUMNS = 2,
+    GGML_TP_SPLIT_REDUCE = 3,
+};
+
 struct ggml_tensor_parallel_extra {
     // these are the tensors that are on the parallel GPU, they may or may not be split.
     // todo: because llama cpp does not provide the full graph up front, these tensors are
@@ -50,7 +57,7 @@ struct ggml_tensor_parallel_extra {
     bool computed[TP_MAX_DEVICES];
 
     // flag for whether the tensors are split. split tensors will have a full tensor in converted_tensors.
-    bool split_tensors;
+    ggml_tp_split_type split_tensors;
 
 #if GGML_BACKEND_TP_VALIDATE
     char *original_data;
@@ -85,8 +92,6 @@ struct ggml_tensor_parallel_extra {
 
     ggml_tensor * reduce_op_tensors[TP_MAX_DEVICES];
     ggml_tensor * reduce_split_views[TP_MAX_DEVICES];
-
-    bool weight_column_split;
 
     ~ggml_tensor_parallel_extra() {
         if (rejoined_buffer) {
@@ -1354,10 +1359,10 @@ static void ensure_weight_column_split(ggml_tensor * weight, ggml_tensor * mulma
         return;
     }
 
-    if (extra->weight_column_split) {
+    if (extra->split_tensors == GGML_TP_SPLIT_COLUMNS) {
         return;
     }
-    extra->weight_column_split = true;
+    extra->split_tensors = GGML_TP_SPLIT_COLUMNS;
 
     // the weight tensor is currently split by rows, reassemble it
     auto size = ggml_nbytes(weight);
@@ -1446,7 +1451,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
     // determine whether this tensor op results in a split output.
     // this may be due to the weights themselves being split, or the tensor being a result of
     // a split compatible operation on a split src tensor.
-    auto split = ctx->split;
     auto split_from_src = false;
     auto split_reduced_add = false;
 
@@ -1487,7 +1491,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             }
         }
     }
-    else if (!split) {
+    else if (!ctx->split) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = tensor->src[i];
             if (!src) {
@@ -1501,7 +1505,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                     ensure_rejoined(tensor, src);
                     continue;
                 }
-                split = true;
                 split_from_src = true;
                 break;
             }
@@ -1579,7 +1582,26 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         }
     }
 
-    extra->split_tensors = split;
+    if (ctx->split) {
+        extra->split_tensors = GGML_TP_SPLIT_ROWS;
+    }
+    else if (split_from_src) {
+        if (extra->has_reduce) {
+            extra->split_tensors = GGML_TP_SPLIT_REDUCE;
+        }
+        else if (tensor->op == GGML_OP_ROPE) {
+            extra->split_tensors = GGML_TP_SPLIT_ROWS;
+        }
+        else if (tensor->op == GGML_OP_MUL_MAT) {
+            extra->split_tensors = GGML_TP_SPLIT_COLUMNS;
+        }
+        else {
+            // all unary, binary, and view ops match the split of the src.
+            auto src = tensor->src[0];
+            auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+            extra->split_tensors = src_extra->split_tensors;
+        }
+    }
 
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         ggml_tensor * wrapped = ggml_backend_tp_clone_tensor(tensor);
@@ -1588,7 +1610,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
         auto device_alignment = ggml_backend_tp_buffer_type_get_alignment(backend_buffer->buft);
 
-        if (split) {
+        if (extra->split_tensors) {
             if (tensor->op == GGML_OP_CPY) {
                 ggml_split splits = get_col_splits(tensor);
                 // adjust the stride for the new row count
