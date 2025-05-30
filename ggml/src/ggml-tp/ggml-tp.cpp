@@ -66,8 +66,6 @@ struct ggml_tensor_parallel_extra {
 
     // this tensor needs to be rejoined for another op.
     bool has_rejoin;
-    // this tensor needs to be reduced prior to use by another op.
-    bool has_reduce;
 
     // this tensor does not support split ops and has a src that needs to be rejoined.
     bool needs_src_rejoin;
@@ -196,8 +194,8 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
 
-            if (src_extra->has_reduce) {
-                if (extra->has_reduce) {
+            if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+                if (extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
                     wrapped->src[i] = src_extra->tensors[j];
                 }
                 else if (extra->split_tensors) {
@@ -233,7 +231,7 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
 
             if (tensor->op == GGML_OP_RMS_NORM) {
                 ggml_tensor * check;
-                if (src_extra->has_reduce) {
+                if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
                     check = src_extra->tensors[j];
                 }
                 else if (src_extra->split_tensors) {
@@ -502,7 +500,7 @@ struct ggml_backend_tp_buffer_context {
 
 static void ensure_reduce_split_views(const ggml_tensor *tensor) {
     ggml_tensor_parallel_extra *extra = (ggml_tensor_parallel_extra *)tensor->extra;
-    if (!extra->has_reduce) {
+    if (extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
         return;
     }
     if (extra->reduce_split_views[0]){ 
@@ -556,7 +554,7 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
 
     auto ctx = (ggml_backend_tp_buffer_context *)src->buffer->context;
 
-    auto reduce_scale = src_extra->has_reduce ? ggml_parallel_devices.size() : 1;
+    auto reduce_scale = src_extra->split_tensors == GGML_TP_SPLIT_REDUCE ? ggml_parallel_devices.size() : 1;
 
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto dev = ggml_parallel_devices[j];
@@ -770,7 +768,7 @@ static void release_peers(struct compute_thread * thread) {
 
 static ggml_status reduce_joined_tensors(int device_index, const ggml_tensor * tensor ) {
     auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
-    if (!extra->has_reduce) {
+    if (extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
         return GGML_STATUS_SUCCESS;
     }
 
@@ -816,7 +814,7 @@ static ggml_status ggml_backend_tp_node_compute_split(int device_index, ggml_ten
     auto be = ggml_parallel_backends[device_index];
     auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
     auto wrapped = extra->tensors[device_index];
-    if (tensor->op != GGML_OP_ADD || !extra->has_reduce) {
+    if (tensor->op != GGML_OP_ADD || extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
         ggml_status status = be->iface.node_compute(be, wrapped);
         return status;
     }
@@ -1195,7 +1193,7 @@ static bool ggml_backend_tp_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         return false;
     }
     auto dst_extra = (ggml_tensor_parallel_extra *)dst->extra;
-    if (dst_extra->split_tensors || dst_extra->has_reduce) {
+    if (dst_extra->split_tensors || dst_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
         GGML_ABORT("Tensor %s is split, but set_tensor_async is called\n", dst->name);
     }
 
@@ -1209,7 +1207,7 @@ static bool ggml_backend_tp_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     }
 
     auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-    if (src_extra->has_reduce) {
+    if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
         GGML_ABORT("Tensor %s is reduced, but cpy_tensor_async is called\n", src->name);
     }
 
@@ -1521,7 +1519,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
                 // unless this is an add op, a tensor in a reduced state
                 // does not count as a split tensor. it will require a rejoin.
-                if (src_extra->has_reduce && tensor->op != GGML_OP_ADD) {
+                if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE && tensor->op != GGML_OP_ADD) {
                     ensure_rejoined(tensor, src);
                     continue;
                 }
@@ -1557,7 +1555,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                     }
                     else {
                         ensure_weight_column_split(src0, tensor);
-                        extra->has_reduce = true;
+                        extra->split_tensors = GGML_TP_SPLIT_REDUCE;
                     }
                 }
             }
@@ -1584,19 +1582,19 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         auto src1 = tensor->src[1];
         auto src1_extra = (ggml_tensor_parallel_extra *)src1->extra;
 
-        bool can_reduce = (src0_extra->has_reduce && !src0_extra->has_rejoin) || (src1_extra->has_reduce && !src1_extra->has_rejoin);
-        bool double_reduce = src0_extra->has_reduce && src1_extra->has_reduce;
+        bool can_reduce = (src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE && !src0_extra->has_rejoin) || (src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE && !src1_extra->has_rejoin);
+        bool double_reduce = src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE && src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE;
         if (can_reduce) {
             ensure_split(src0);
             ensure_split(src1);
-            extra->has_reduce = true;
+            extra->split_tensors = GGML_TP_SPLIT_REDUCE;
             split_reduced_add = true;
         }
         else {
-            if (src0_extra->has_reduce && src0_extra->has_rejoin) {
+            if (src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE && src0_extra->has_rejoin) {
                 ensure_reduce_split_views(src0);
             }
-            if (src1_extra->has_reduce && src1_extra->has_rejoin) {
+            if (src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE && src1_extra->has_rejoin) {
                 ensure_reduce_split_views(src1);
             }
         }
@@ -1606,8 +1604,8 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         extra->split_tensors = GGML_TP_SPLIT_ROWS;
     }
     else if (split_from_src) {
-        if (extra->has_reduce) {
-            extra->split_tensors = GGML_TP_SPLIT_REDUCE;
+        if (extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+            // no-op
         }
         else if (tensor->op == GGML_OP_ROPE) {
             // rope input is initially on columns.
@@ -1776,7 +1774,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         wrapped->nb[3] = src_extra->tensors[j]->nb[3];
                     }
                     else {
-                        if (!extra->has_reduce) {
+                        if (extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
                             ggml_split splits = get_col_splits(vs);
                             
                             // update col count
@@ -1861,17 +1859,17 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         auto src1 = tensor->src[1];
 
         // one of these must be a reduce tensor, the other may be a split tensor, unsplit tensor, or even another reduce tensor.
-        auto reduce_tensor = src0_extra->has_reduce ? src0 : src1;
-        auto add_tensor = src0_extra->has_reduce ? src1 : src0;
+        auto reduce_tensor = src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE ? src0 : src1;
+        auto add_tensor = src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE ? src1 : src0;
         auto add_extra = (ggml_tensor_parallel_extra *)add_tensor->extra;
         auto reduce_extra = (ggml_tensor_parallel_extra *)reduce_tensor->extra;
 
-        if (add_extra->has_reduce && reduce_extra->has_reduce && add_extra->has_rejoin && reduce_extra->has_rejoin) {
+        if (add_extra->split_tensors == GGML_TP_SPLIT_REDUCE && reduce_extra->split_tensors == GGML_TP_SPLIT_REDUCE && add_extra->has_rejoin && reduce_extra->has_rejoin) {
             // could fix this
             GGML_ABORT("ggml_backend_tp_buffer_init_tensor: cannot have two reduce tensors with rejoin in an add op\n");
         }
 
-        if (add_extra->has_reduce) {
+        if (add_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
             // double reduce add can simply be added without any views.
             for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
                 auto wrapped = extra->tensors[j];
