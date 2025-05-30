@@ -1590,16 +1590,37 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             extra->split_tensors = GGML_TP_SPLIT_REDUCE;
         }
         else if (tensor->op == GGML_OP_ROPE) {
+            // rope input is initially on columns.
+            // input to rope is split [8192,1,1,1], per gpu it is [4096,1,1,1]
+            // rope is then reshaped [128,64,1,1] per gpu it is [128,32,1,1]
+            // this effectively splits it on the head dim 64->32 heads.
+            // the output from rope is [128,64,1,1] per gpu it is [128,32,1,1]
+            // this means that the rope output is now split on rows.
             extra->split_tensors = GGML_TP_SPLIT_ROWS;
         }
         else if (tensor->op == GGML_OP_MUL_MAT) {
             extra->split_tensors = GGML_TP_SPLIT_COLUMNS;
         }
         else {
-            // all unary, binary, and view ops match the split of the src.
-            auto src = tensor->src[0];
-            auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-            extra->split_tensors = src_extra->split_tensors;
+            // all unary, binary, and view ops match the split of the src, but validate it.
+            for (int i = 0 ; i < GGML_MAX_SRC; i++) {
+                auto src = tensor->src[i];
+                if (!src) {
+                    break;
+                }
+                auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+                
+                if (src_extra->split_tensors && src_extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
+                    if (extra->split_tensors && src_extra->split_tensors != extra->split_tensors) {
+                        GGML_ABORT("ggml_backend_tp_buffer_init_tensor: tensor %s has split src %s with different split type %d vs %d\n",
+                            tensor->name, src->name, src_extra->split_tensors, extra->split_tensors);
+                    }
+                    extra->split_tensors = src_extra->split_tensors;
+                }
+            }
+            if (!extra->split_tensors) {
+                GGML_ABORT("ggml_backend_tp_buffer_init_tensor: tensor %s has split src but no split type set\n", tensor->name);
+            }
         }
     }
 
