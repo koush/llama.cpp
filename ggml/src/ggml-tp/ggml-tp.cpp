@@ -2188,37 +2188,27 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
                 break;
             }
             if (src->buffer && ggml_backend_buft_is_tp_split(src->buffer->buft)) {
-                if (src->ne[1] != 1) {
-                    return false;
-                }
-                // this seems to be dead code
-                return src->ne[1] >= 2048;
-                return src->ne[1] >= 8192;
+                return false;
             }
         }
-    }
-    else {
-        // only src0 is supported for split buffer. src1 is never called here with a weight buffer,
-        // so this path is never actually used, only for sanity checking.
-        auto src1 = op->src[1];
-        if (src1->buffer && ggml_backend_buft_is_tp_split(src1->buffer->buft)) {
-            return false;
-        }
 
-        auto src0 = op->src[0];
-        if (!ggml_backend_buft_is_tp_split(src0->buffer->buft)) {
-            return true;
-        }
-
-        return src0->ne[1] >= 2048;
-        return src0->ne[1] >= 8192;
-
-        // print ne dims
-        printf("ggml_backend_tp_device_supports_op: op %s with ne dims: %zu %zu\n", ggml_op_name(op->op), op->ne[0], op->ne[1]);
         return true;
     }
 
-    return true;
+    // only src0 is supported for split buffer. src1 is never called here with a weight buffer,
+    // so this path is never actually used, only for sanity checking.
+    auto src1 = op->src[1];
+    if (src1->buffer && ggml_backend_buft_is_tp_split(src1->buffer->buft)) {
+        return false;
+    }
+
+    auto src0 = op->src[0];
+    if (!ggml_backend_buft_is_tp_split(src0->buffer->buft)) {
+        return true;
+    }
+
+    return src0->ne[1] >= 2048;
+    return src0->ne[1] >= 8192;
 }
 
 static bool ggml_backend_tp_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
