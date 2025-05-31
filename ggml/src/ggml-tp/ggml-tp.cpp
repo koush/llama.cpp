@@ -1632,6 +1632,11 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 ensure_dim2_split(tensor->src[1]);
                 ensure_dim2_split(tensor->src[2]);
             }
+            else if (tensor->op == GGML_OP_CPY) {
+                auto src0 = tensor->src[0];
+                auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
+                extra->split_tensors = src0_extra->split_tensors;
+            }
             else if (tensor->op != GGML_OP_UNARY && tensor->op != GGML_OP_ROPE) {
                 // printf("ggml_backend_tp_buffer_init_tensor: splitting tensor %s with op %s\n", tensor->name, ggml_op_name(tensor->op));
                 for (int i = 0; i < GGML_MAX_SRC; i++) {
