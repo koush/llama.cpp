@@ -1586,7 +1586,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
                 // unless this is an add op, a tensor in a reduced state
                 // does not count as a split tensor. it will require a rejoin.
-                if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE && tensor->op != GGML_OP_ADD) {
+                if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE && tensor->op != GGML_OP_ADD && tensor->op != GGML_OP_GET_ROWS) {
                     ensure_rejoined(tensor, src);
                     continue;
                 }
@@ -1672,6 +1672,13 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             if (src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE && src1_extra->has_rejoin) {
                 ensure_reduce_split_views(src1);
             }
+        }
+    }
+    else if (tensor->op == GGML_OP_GET_ROWS) {
+        auto src0 = tensor->src[0];
+        auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
+        if (src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE && !src0_extra->has_rejoin) {
+            extra->split_tensors = GGML_TP_SPLIT_REDUCE;
         }
     }
 
@@ -1767,37 +1774,60 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                     }
                 }
                 else {
-                    auto original_ne0 = wrapped->ne[0];
                     if (tensor->op == GGML_OP_RESHAPE) {
                         // ehhhhh i dunno man.
                         // 8192x2x1x1 -> 128x64x2x1
                         // 8192 is column partitioned into two 4096x2x1x1
                         // 4096 / 128 = 32 so actual reshape result is 128x32x2x1
-                        // auto splits = get_col_splits(tensor);
 
                         auto src = tensor->src[0];
                         auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
-                        auto src_cols = src_extra->tensors[j]->ne[0];
 
-                        if (src_cols > wrapped->ne[0]) {
-                            auto original_ne1 = wrapped->ne[1];
-                            wrapped->ne[1] = src_cols / wrapped->ne[0];
-                            if (wrapped->ne[1] >= original_ne1) {
-                                wrapped->ne[2] = wrapped->ne[1] / original_ne1;
-                                wrapped->ne[1] = original_ne1;
+                        if (src_extra->split_tensors == GGML_TP_SPLIT_COLUMNS) {
+                            auto src_cols = src_extra->tensors[j]->ne[0];
+                            if (src_cols > wrapped->ne[0]) {
+                                auto original_ne1 = wrapped->ne[1];
+                                wrapped->ne[1] = src_cols / wrapped->ne[0];
+                                if (wrapped->ne[1] >= original_ne1) {
+                                    wrapped->ne[2] = wrapped->ne[1] / original_ne1;
+                                    wrapped->ne[1] = original_ne1;
+                                }
+                                else {
+                                    wrapped->ne[2] = tensor->ne[2];
+                                }
+                                wrapped->ne[3] = tensor->ne[3];
+                                if (tensor->ne[3] > 1) {
+                                    int i = 0;
+                                }
                             }
                             else {
-                                wrapped->ne[2] = tensor->ne[2];
+                                GGML_ABORT("ggml_backend_tp_buffer_init_tensor: tensor %s has src %s with split columns but src cols %zu < wrapped ne[0] %zu\n", tensor->name, src->name, src_cols, wrapped->ne[0]);
+                                // auto original_ne0 = wrapped->ne[0];
+                                // wrapped->ne[0] = src_cols;
+                                // wrapped->ne[2] = wrapped->ne[2] * original_ne0 / wrapped->ne[0];
                             }
-                            wrapped->ne[3] = tensor->ne[3];
-                            if (tensor->ne[3] > 1) {
-                                int i = 0;
+                        }
+                        else if (src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
+                            // 128x64x2x1 -> 8192x2x1x1
+                            // 64 is row partitioned into two 128x32x2x1
+                            // 128 * 32 = 4096 (the 2 dim is ignores since that would not be contiguous in memory row-wise)
+                            // so actual reshape result is 4096x2x1x1
+                            // interestingly the split type changes to column here.
+
+                            auto src_rows_length = src_extra->tensors[j]->ne[0] * src_extra->tensors[j]->ne[1];
+                            if (src_rows_length > tensor->ne[0]) {
+                                // could implement it but no need yet.
+                                GGML_ABORT("ggml_backend_tp_buffer_init_tensor: tensor %s has src %s with split rows but src rows length %zu > wrapped ne[0] %zu\n", tensor->name, src->name, src_rows_length, wrapped->ne[0]);
+                            }
+                            else {
+                                wrapped->ne[0] = src_rows_length;
+                                wrapped->ne[1] = src_extra->tensors[j]->ne[2];
+
+                                extra->split_tensors = GGML_TP_SPLIT_COLUMNS;
                             }
                         }
                         else {
-                            auto original_ne0 = wrapped->ne[0];
-                            wrapped->ne[0] = src_cols;
-                            wrapped->ne[2] = wrapped->ne[2] * original_ne0 / wrapped->ne[0];
+                            GGML_ABORT("ggml_backend_tp_buffer_init_tensor: tensor %s has src %s with unknown split type %d\n", tensor->name, src->name, src_extra->split_tensors);
                         }
 
                         wrapped->nb[1] = wrapped->nb[0] * wrapped->ne[0];
@@ -1816,7 +1846,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         wrapped->nb[1] = src_extra->tensors[j]->nb[1];
                         wrapped->nb[2] = src_extra->tensors[j]->nb[2];
                         wrapped->nb[3] = src_extra->tensors[j]->nb[3];
-                        ensure_rejoined(nullptr, tensor);
                     }
                     else if (tensor->op == GGML_OP_PERMUTE) {
                         auto src = tensor->src[0];
@@ -1851,6 +1880,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                     }
                     else {
                         if (extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
+                            auto original_ne0 = wrapped->ne[0];
                             ggml_split splits = get_col_splits(vs);
                             
                             // update col count
