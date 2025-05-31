@@ -171,10 +171,6 @@ static void ggml_backend_tp_synchronize(ggml_backend_t backend) {
 
 static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensors) {
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
-    std::string name = tensor->name;
-    if (name == "l_out-0") {
-        int i =0;
-    }
 
     auto found = tensors.find(tensor);
     if (found != tensors.end()) {
@@ -465,6 +461,7 @@ static ggml_status ensure_row_split(const ggml_tensor *src) {
 
         offset += src->nb[0] / src->ne[1] * splits.split[j];
     }
+    return GGML_STATUS_SUCCESS;
 }
 
 static ggml_status ensure_column_or_reduce_split(const ggml_tensor *src) {
@@ -1793,9 +1790,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                                     wrapped->ne[2] = tensor->ne[2];
                                 }
                                 wrapped->ne[3] = tensor->ne[3];
-                                if (tensor->ne[3] > 1) {
-                                    int i = 0;
-                                }
                             }
                             else {
                                 GGML_ABORT("ggml_backend_tp_buffer_init_tensor: tensor %s has src %s with split columns but src cols %zu < wrapped ne[0] %zu\n", tensor->name, src->name, src_cols, wrapped->ne[0]);
@@ -1886,9 +1880,6 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                             wrapped->nb[1] = wrapped->nb[1] / original_ne0 * splits.split[j];
                             wrapped->nb[2] = wrapped->nb[2] / original_ne0 * splits.split[j];
                             wrapped->nb[3] = wrapped->nb[3] / original_ne0 * splits.split[j];
-                        }
-                        else {
-                            int i = 0;
                         }
                     }
                 }
