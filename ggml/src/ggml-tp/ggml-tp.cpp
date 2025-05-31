@@ -226,7 +226,12 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
             if (i == 1 && tensor->op == GGML_OP_ROPE) {
                 wrapped->src[i] = src_extra->tensors[j];
             }
+
             if (i == 3 && tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+                wrapped->src[i] = src_extra->tensors[j];
+            }
+
+            if (i == 1 && tensor->op == GGML_OP_GET_ROWS) {
                 wrapped->src[i] = src_extra->tensors[j];
             }
 
@@ -261,7 +266,7 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
             }
 
             if (!wrapped->src[i]) {
-                GGML_LOG_ERROR("Tensor %s unwrap failure.\n", tensor->name, src->name);
+                GGML_ABORT("Tensor %s unwrap failure.\n", tensor->name, src->name);
             }
         }
     }
@@ -329,7 +334,7 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_ROPE:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_CPY:
-        // case GGML_OP_GET_ROWS:
+        case GGML_OP_GET_ROWS:
             return true;
         default:
             return false;
@@ -1625,8 +1630,10 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 auto src0 = tensor->src[0];
                 auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
             }
+            else if (tensor->op == GGML_OP_GET_ROWS) {
+                // nothing to split.
+            }
             else if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
-                int i = 0;
                 ensure_row_split(tensor->src[0]);
                 ensure_dim2_split(tensor->src[1]);
                 ensure_dim2_split(tensor->src[2]);
