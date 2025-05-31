@@ -45,6 +45,7 @@ enum ggml_tp_split_type {
     GGML_TP_SPLIT_ROWS = 1,
     GGML_TP_SPLIT_COLUMNS = 2,
     GGML_TP_SPLIT_REDUCE = 3,
+    GGML_TP_SPLIT_DIM2 = 4,
 };
 
 struct ggml_tensor_parallel_extra {
@@ -225,7 +226,7 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
             if (i == 1 && tensor->op == GGML_OP_ROPE) {
                 wrapped->src[i] = src_extra->tensors[j];
             }
-            if (i > 0 && tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+            if (i == 3 && tensor->op == GGML_OP_FLASH_ATTN_EXT) {
                 wrapped->src[i] = src_extra->tensors[j];
             }
 
@@ -326,8 +327,9 @@ static bool is_split_compatible(ggml_tensor * tensor) {
         case GGML_OP_RESHAPE:
         case GGML_OP_PERMUTE:
         case GGML_OP_ROPE:
-        // case GGML_OP_FLASH_ATTN_EXT:
-        // case GGML_OP_CPY:
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_CPY:
+        // case GGML_OP_GET_ROWS:
             return true;
         default:
             return false;
@@ -393,9 +395,79 @@ static size_t ggml_backend_tp_buffer_type_get_alignment(ggml_backend_buffer_type
     GGML_UNUSED(buft);
 }
 
-static ggml_status ensure_split(const ggml_tensor *src) {
+static ggml_status ensure_dim2_split(const ggml_tensor *src) {
     auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
     if (src_extra->split_tensors) {
+        if (src_extra->split_tensors != GGML_TP_SPLIT_ROWS) {
+            GGML_ABORT("Tensor %s is already split as %d, but requested to be split as rows.\n", src->name, src_extra->split_tensors);
+        }
+        // this tensor is already split, so we don't need to do anything
+        return GGML_STATUS_SUCCESS;
+    }
+    if (src_extra->converted_tensors[0]) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // no actual conversion needs to take place, the split tensors can be
+    // created by using offsets within the original tensor.
+    auto splits = get_dim_splits(src->ne[2]);
+    size_t offset = 0;
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto split = ggml_backend_tp_clone_tensor(src);
+        split->op = GGML_OP_NONE;
+        src_extra->converted_tensors[j] = split;
+
+        split->buffer = src_extra->tensors[j]->buffer;
+        split->data = (char *) src_extra->tensors[j]->data + offset;
+
+        // note that only the dimension needs to be changed, retaining the stride allows
+        // using the original tensor data for the row split.
+        split->ne[2] = splits.split[j];
+
+        offset += src->nb[1] / src->ne[2] * splits.split[j];
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static ggml_status ensure_row_split(const ggml_tensor *src) {
+    auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+    if (src_extra->split_tensors) {
+        if (src_extra->split_tensors != GGML_TP_SPLIT_ROWS) {
+            GGML_ABORT("Tensor %s is already split as %d, but requested to be split as rows.\n", src->name, src_extra->split_tensors);
+        }
+        // this tensor is already split, so we don't need to do anything
+        return GGML_STATUS_SUCCESS;
+    }
+    if (src_extra->converted_tensors[0]) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // no actual conversion needs to take place, the split tensors can be
+    // created by using offsets within the original tensor.
+    auto splits = get_row_splits(src);
+    size_t offset = 0;
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto split = ggml_backend_tp_clone_tensor(src);
+        split->op = GGML_OP_NONE;
+        src_extra->converted_tensors[j] = split;
+
+        split->buffer = src_extra->tensors[j]->buffer;
+        split->data = (char *) src_extra->tensors[j]->data + offset;
+
+        // note that only the dimension needs to be changed, retaining the stride allows
+        // using the original tensor data for the row split.
+        split->ne[1] = splits.split[j];
+
+        offset += src->nb[0] / src->ne[1] * splits.split[j];
+    }
+}
+
+static ggml_status ensure_column_or_reduce_split(const ggml_tensor *src) {
+    auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+    if (src_extra->split_tensors) {
+        if (src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
+            GGML_ABORT("Tensor %s is already split as %d, but requested to be split as columns.\n", src->name, src_extra->split_tensors);
+        }
         // this tensor is already split, so we don't need to do anything
         return GGML_STATUS_SUCCESS;
     }
@@ -547,7 +619,7 @@ static ggml_status ensure_rejoined(const ggml_tensor *reason, const ggml_tensor 
     src_extra->has_rejoin = true;
 
     // if (reason && reason != src) {
-    //     printf("Rejoining tensor for %s %d %d\n", ggml_op_name(reason->op), src->ne[0], src->ne[1]);
+    //     printf("Rejoining tensor for %s %s\n", ggml_op_name(reason->op), ggml_op_name(src->op));
     // }
 
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(src->buffer->buft);
@@ -907,16 +979,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             continue;
         }
 
-        auto vs = tensor;
-        while (vs->view_src) {
-            vs = vs->view_src;
-        }
-        if ((vs->ne[2] > 1 || vs->ne[3] > 1)) {
-            if (!ggml_is_contiguous(vs)) {
-                GGML_ABORT("Tensor %s has more than 2 dimensions, not supported for TP.\n", tensor->name);
-            }
-        }
-
         pending_rejoins.insert(tensor);
 
         if (!be->iface.cpy_tensor2d_async) {
@@ -969,7 +1031,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     std::set<ggml_backend_tp_buffer_context *> contexts;
     for (auto tensor : tensors) {
         auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
-        if (tensor->view_src && extra->needs_src_rejoin) {
+        if (tensor->view_src) {
             auto view_src = tensor->view_src;
             auto view_src_extra = (ggml_tensor_parallel_extra *)view_src->extra;
             if (view_src_extra->has_rejoin) {
@@ -1563,14 +1625,20 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 auto src0 = tensor->src[0];
                 auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
             }
-            else if (tensor->op != GGML_OP_UNARY && tensor->op != GGML_OP_FLASH_ATTN_EXT && tensor->op != GGML_OP_ROPE) {
+            else if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+                int i = 0;
+                ensure_row_split(tensor->src[0]);
+                ensure_dim2_split(tensor->src[1]);
+                ensure_dim2_split(tensor->src[2]);
+            }
+            else if (tensor->op != GGML_OP_UNARY && tensor->op != GGML_OP_ROPE) {
                 // printf("ggml_backend_tp_buffer_init_tensor: splitting tensor %s with op %s\n", tensor->name, ggml_op_name(tensor->op));
                 for (int i = 0; i < GGML_MAX_SRC; i++) {
                     auto src = tensor->src[i];
                     if (!src) {
                         break;
                     }
-                    ensure_split(src);
+                    ensure_column_or_reduce_split(src);
                 }
             }
         }
@@ -1585,8 +1653,8 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         bool can_reduce = (src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE && !src0_extra->has_rejoin) || (src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE && !src1_extra->has_rejoin);
         bool double_reduce = src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE && src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE;
         if (can_reduce) {
-            ensure_split(src0);
-            ensure_split(src1);
+            ensure_column_or_reduce_split(src0);
+            ensure_column_or_reduce_split(src1);
             extra->split_tensors = GGML_TP_SPLIT_REDUCE;
             split_reduced_add = true;
         }
@@ -1741,6 +1809,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                         wrapped->nb[1] = src_extra->tensors[j]->nb[1];
                         wrapped->nb[2] = src_extra->tensors[j]->nb[2];
                         wrapped->nb[3] = src_extra->tensors[j]->nb[3];
+                        ensure_rejoined(nullptr, tensor);
                     }
                     else if (tensor->op == GGML_OP_PERMUTE) {
                         auto src = tensor->src[0];
