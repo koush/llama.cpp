@@ -936,22 +936,16 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         if (extra->needs_src_rejoin && pending_rejoins.size()) {
             rejoins++;
             thread->end = node_index;
+            // synchronize self and then release peers
+            ggml_backend_synchronize(be);
             release_peers(thread);
 
             // wait for everyone else
             for (size_t i = 0; i < thread->peers->size(); i++) {
                 ggml_backend_tp_semaphore_acquire(&thread->semaphore);
             }
-        
-            if (device_index == 0) {
-                for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-                    auto backend = ggml_parallel_backends[j];
-                    ggml_backend_synchronize(backend);
-                }
-                release_peers(thread);
-            }
-            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
 
+            // once all peers are done, we can rejoin the tensors
             for (auto & pending : pending_rejoins) {
                 reduce_joined_tensors(device_index, pending);
                 auto pending_extra = (ggml_tensor_parallel_extra *)pending->extra;
