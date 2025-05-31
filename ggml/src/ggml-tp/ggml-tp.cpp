@@ -2173,6 +2173,14 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
         return false;
     }
 
+    // the tensor must also be compatible with all the parallel devices.
+    for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
+        auto dev = ggml_parallel_devices[i];
+        if (!dev->iface.supports_op(dev, op)) {
+            return false;
+        }
+    }
+
     if (op->op != GGML_OP_MUL_MAT) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = op->src[i];
@@ -2197,14 +2205,6 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
             return false;
         }
 
-        // the tensor must also be compatible with all the parallel devices.
-        for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
-            auto dev = ggml_parallel_devices[i];
-            if (!dev->iface.supports_op(dev, op)) {
-                return false;
-            }
-        }
-
         auto src0 = op->src[0];
         if (!ggml_backend_buft_is_tp_split(src0->buffer->buft)) {
             return true;
@@ -2216,15 +2216,6 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
         // print ne dims
         printf("ggml_backend_tp_device_supports_op: op %s with ne dims: %zu %zu\n", ggml_op_name(op->op), op->ne[0], op->ne[1]);
         return true;
-    }
-
-
-    // the tensor must also be compatible with all the parallel devices.
-    for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
-        auto dev = ggml_parallel_devices[i];
-        if (!dev->iface.supports_op(dev, op)) {
-            return false;
-        }
     }
 
     return true;
