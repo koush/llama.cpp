@@ -1633,9 +1633,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
                 ensure_dim2_split(tensor->src[2]);
             }
             else if (tensor->op == GGML_OP_CPY) {
-                auto src0 = tensor->src[0];
-                auto src0_extra = (ggml_tensor_parallel_extra *)src0->extra;
-                extra->split_tensors = src0_extra->split_tensors;
+                // nothing to split.
             }
             else if (tensor->op != GGML_OP_UNARY && tensor->op != GGML_OP_ROPE) {
                 // printf("ggml_backend_tp_buffer_init_tensor: splitting tensor %s with op %s\n", tensor->name, ggml_op_name(tensor->op));
@@ -2194,6 +2192,7 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
                 if (src->ne[1] != 1) {
                     return false;
                 }
+                // this seems to be dead code
                 return src->ne[1] >= 2048;
                 return src->ne[1] >= 8192;
             }
