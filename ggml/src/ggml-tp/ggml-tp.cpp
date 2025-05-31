@@ -1111,90 +1111,10 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
-    if (ctx->split) {
-        if (tensor->ne[2] > 1) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: tensor %s is not a split compatible tensor\n", tensor->name);
-            return;
+    if (!ctx->split) {
+        if (extra->split_tensors) {
+            GGML_ABORT("ggml_backend_tp_buffer_set_tensor: tensor %s is split, but the context is not split\n", tensor->name);
         }
-        if (tensor->ne[3] > 1) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: tensor %s is not a split compatible tensor\n", tensor->name);
-            return;
-        }
-
-        if (size % tensor->ne[1] != 0) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: size %zu is not a multiple of tensor->ne[1] %zu\n", size, tensor->ne[1]);
-            return;
-        }
-        if (offset) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: offset %zu is not zero\n", offset);
-            return;
-        }
-        if (tensor->view_src) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: split tensor %s has unsupported view_src %s\n", tensor->name, tensor->view_src->name);
-            return;
-        }
-
-        // this should just be the value of tensor-nb[1] right?
-        auto bytes_per_row = size / tensor->ne[1];
-        if (bytes_per_row != tensor->nb[1]) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: bytes_per_row %zu != tensor->nb[1] %zu\n", bytes_per_row, tensor->nb[1]);
-            return;
-        }
-
-        if (tensor->ne[1] != 1) {
-            // weight matrices used for mul mat are transposed, so split on row
-            ggml_split splits = get_row_splits(tensor);
-            size_t cur_row = 0;
-            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-                auto wrapped = extra->tensors[j];
-                auto be = ggml_parallel_backends[j];
-    
-                // the split tensors should have the same alignment as the wrapping tensor, and thus the same stride.
-                if (wrapped->nb[1] != tensor->nb[1]) {
-                    GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: wrapped->nb[1] %zu != tensor->nb[1] %zu\n", wrapped->nb[1], tensor->nb[1]);
-                    return;
-                }
-    
-                auto split_offset = cur_row * bytes_per_row;
-                auto split_size = (size_t) splits.split[j] * bytes_per_row;
-                
-                if (be->iface.set_tensor_async) {
-                    be->iface.set_tensor_async(be, wrapped, (const char *) data + split_offset, 0, split_size);
-                }
-                else {
-                    auto backend_buffer = ctx->backend_buffers[j];
-                    backend_buffer->iface.set_tensor(backend_buffer, wrapped, (const char *) data + split_offset, 0, split_size);
-                }
-    
-                cur_row += splits.split[j];
-            }
-        }
-        else {
-            auto split_offset = 0;
-            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-                auto wrapped = extra->tensors[j];
-                auto be = ggml_parallel_backends[j];
-
-                auto split_size = wrapped->nb[1];
-
-                if (be->iface.set_tensor_async) {
-                    be->iface.set_tensor_async(be, wrapped, (const char *) data + split_offset, 0, split_size);
-                }
-                else {
-                    auto backend_buffer = ctx->backend_buffers[j];
-                    backend_buffer->iface.set_tensor(backend_buffer, wrapped, (const char *) data + split_offset, 0, split_size);
-                }
-                split_offset += split_size;
-            }
-        }
-
-#if GGML_BACKEND_TP_VALIDATE
-        extra->original_data = (char *)malloc(size);
-        memcpy(extra->original_data, data, size);
-        extra->original_size = size;
-#endif
-    }
-    else {
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
             auto be = ggml_parallel_backends[j];
@@ -1206,6 +1126,34 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
                 backend_buffer->iface.set_tensor(backend_buffer, wrapped, data, offset, size);
             }
         }
+        return;
+    }
+
+    // weight matrices used for mul mat are transposed, so split on row
+    ggml_split splits = get_row_splits(tensor);
+    size_t cur_row = 0;
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto wrapped = extra->tensors[j];
+        auto be = ggml_parallel_backends[j];
+
+        // the split tensors should have the same alignment as the wrapping tensor, and thus the same stride.
+        if (wrapped->nb[1] != tensor->nb[1]) {
+            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: wrapped->nb[1] %zu != tensor->nb[1] %zu\n", wrapped->nb[1], tensor->nb[1]);
+            return;
+        }
+
+        auto split_offset = cur_row * tensor->nb[1];
+        auto split_size = (size_t) splits.split[j] * tensor->nb[1];
+        
+        if (be->iface.set_tensor_async) {
+            be->iface.set_tensor_async(be, wrapped, (const char *) data + split_offset, 0, split_size);
+        }
+        else {
+            auto backend_buffer = ctx->backend_buffers[j];
+            backend_buffer->iface.set_tensor(backend_buffer, wrapped, (const char *) data + split_offset, 0, split_size);
+        }
+
+        cur_row += splits.split[j];
     }
 }
 
