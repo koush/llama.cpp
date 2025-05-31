@@ -532,6 +532,7 @@ struct ggml_backend_tp_buffer_context {
     // this can not be determined until the graph is fully constructed.
     ggml_backend_buffer_t backend_buffers[TP_MAX_DEVICES];
 
+    // todo: switch from extra pointer to actually allocating the extra and referencing within the vector.
     std::vector<ggml_tensor_parallel_extra *> extras;
     size_t rejoined_buft_sizes[TP_MAX_DEVICES];
     ggml_backend_buffer_t rejoined_bufts[TP_MAX_DEVICES];
@@ -1127,6 +1128,10 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
 }
 
 static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (tensor->op != GGML_OP_NONE) {
+        GGML_ABORT("ggml_backend_tp_buffer_set_tensor: tensor %s has unexpected op %s\n", tensor->name, ggml_op_name(tensor->op));
+    }
+
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
