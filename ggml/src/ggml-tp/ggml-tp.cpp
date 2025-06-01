@@ -49,6 +49,12 @@ enum ggml_tp_split_type {
 };
 
 struct ggml_tensor_parallel_extra {
+    bool initialized;
+
+    void *init_data;
+    size_t init_data_size;
+    size_t init_data_offset;
+
     // these are the tensors that are on the parallel GPU, they may or may not be split.
     // todo: because llama cpp does not provide the full graph up front, these tensors are
     // fully allocated on each backend device.
@@ -91,6 +97,11 @@ struct ggml_tensor_parallel_extra {
     ggml_tensor * reduce_split_views[TP_MAX_DEVICES];
 
     ~ggml_tensor_parallel_extra() {
+        if (init_data) {
+            free(init_data);
+            init_data = nullptr;
+        }
+
         if (rejoined_buffer) {
             free(rejoined_buffer);
             rejoined_buffer = nullptr;
@@ -169,6 +180,8 @@ static void ggml_backend_tp_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * tensor);
+
 static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensors) {
     ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
@@ -178,6 +191,17 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
     }
 
     tensors.insert(tensor);
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        auto src = tensor->src[i];
+        if (!src) {
+            break;
+        }
+
+        unwrap_tensor(src, tensors);
+    }
+
+    ggml_backend_tp_buffer_late_init_tensor(tensor);
 
     if (tensor->view_src) {
         auto view_src = tensor->view_src;
@@ -199,7 +223,6 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
             break;
         }
 
-        unwrap_tensor(src, tensors);
         auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
 
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -1142,6 +1165,19 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
         if (tensor->op != GGML_OP_NONE) {
             GGML_ABORT("ggml_backend_tp_buffer_set_tensor: tensor %s has unexpected op %s\n", tensor->name, ggml_op_name(tensor->op));
         }
+
+        if (!extra->initialized) {
+            if (extra->init_data) {
+                free(extra->init_data);
+                extra->init_data = nullptr;
+            }
+            extra->init_data = malloc(size);
+            memcpy(extra->init_data, data, size);
+            extra->init_data_size = size;
+            extra->init_data_offset = offset;
+            return;
+        }
+
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
             auto be = ggml_parallel_backends[j];
@@ -1489,14 +1525,15 @@ static void ensure_weight_column_split(ggml_tensor * weight, ggml_tensor * mulma
     }
 }
 
-static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
-    const auto alignment = ggml_backend_tp_buffer_type_get_alignment(buffer->buft);
+static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * tensor) {
+    ggml_tensor_parallel_extra * extra = (ggml_tensor_parallel_extra *)tensor->extra;
+    if (extra->initialized) {
+        return GGML_STATUS_SUCCESS;
+    }
+    extra->initialized = true;
+
+    ggml_backend_buffer_t buffer = tensor->buffer;
     ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
-
-    ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra();
-    ctx->extras.push_back(extra);
-
-    tensor->extra = extra;
 
     // determine whether this tensor op results in a split output.
     // this may be due to the weights themselves being split, or the tensor being a result of
@@ -1836,6 +1873,7 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
             }
         }
 
+        const auto alignment = ggml_backend_tp_buffer_type_get_alignment(buffer->buft);
         auto device_alignment = ggml_backend_tp_buffer_type_get_alignment(backend_buffer->buft);
 
         if (!tensor->view_src) {
@@ -1965,7 +2003,26 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
         }
     }
 
+    if (extra->init_data) {
+        ggml_backend_set_tensor_async_common(tensor->buffer, tensor, extra->init_data, extra->init_data_offset, extra->init_data_size);
+        free(extra->init_data);
+        extra->init_data = nullptr;
+    }
+
     return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
+
+    ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra();
+    ctx->extras.push_back(extra);
+    tensor->extra = extra;
+
+    if (!ctx->split) {
+        return GGML_STATUS_SUCCESS;
+    }
+    return ggml_backend_tp_buffer_late_init_tensor(tensor);
 }
 
 static void ggml_backend_tp_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
