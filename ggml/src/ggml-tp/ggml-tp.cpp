@@ -51,10 +51,6 @@ enum ggml_tp_split_type {
 struct ggml_tensor_parallel_extra {
     bool initialized;
 
-    void *init_data;
-    size_t init_data_size;
-    size_t init_data_offset;
-
     // these are the tensors that are on the underlying GPUs, they may or may not be split.
     // Because llama cpp does not provide the full graph up front, these tensors are
     // fully allocated on each backend device.
@@ -89,11 +85,6 @@ struct ggml_tensor_parallel_extra {
     ggml_tensor * reduce_split_views[TP_MAX_DEVICES];
 
     ~ggml_tensor_parallel_extra() {
-        if (init_data) {
-            free(init_data);
-            init_data = nullptr;
-        }
-
         for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
             auto tensor = tensors[i];
             if (!tensor) {
@@ -1117,18 +1108,6 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
             GGML_ABORT("ggml_backend_tp_buffer_set_tensor: tensor %s has unexpected op %s\n", tensor->name, ggml_op_name(tensor->op));
         }
 
-        if (!extra->initialized) {
-            if (extra->init_data) {
-                free(extra->init_data);
-                extra->init_data = nullptr;
-            }
-            extra->init_data = malloc(size);
-            memcpy(extra->init_data, data, size);
-            extra->init_data_size = size;
-            extra->init_data_offset = offset;
-            return;
-        }
-
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = extra->tensors[j];
             auto be = ggml_parallel_backends[j];
@@ -1949,12 +1928,6 @@ static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * te
         }
     }
 
-    if (extra->init_data) {
-        ggml_backend_set_tensor_async_common(tensor->buffer, tensor, extra->init_data, extra->init_data_offset, extra->init_data_size);
-        free(extra->init_data);
-        extra->init_data = nullptr;
-    }
-
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1965,7 +1938,10 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
     ctx->extras.push_back(extra);
     tensor->extra = extra;
 
-    if (!ctx->split) {
+    // tensors with ops will be initialized later when determining the graph state.
+    // no-op tensors are always full tensors, and must be initialized immediately as they may be used as input or weights
+    // and will have set_tensor called on them.
+    if (!ctx->split && tensor->op != GGML_OP_NONE) {
         return GGML_STATUS_SUCCESS;
     }
     return ggml_backend_tp_buffer_late_init_tensor(tensor);
