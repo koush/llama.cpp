@@ -55,9 +55,12 @@ struct ggml_tensor_parallel_extra {
     size_t init_data_size;
     size_t init_data_offset;
 
-    // these are the tensors that are on the parallel GPU, they may or may not be split.
-    // todo: because llama cpp does not provide the full graph up front, these tensors are
+    // these are the tensors that are on the underlying GPUs, they may or may not be split.
+    // Because llama cpp does not provide the full graph up front, these tensors are
     // fully allocated on each backend device.
+    // however, trying to map addresses to full vs split tensors to new address spaces
+    // would be a significant endeavour, and may require changes to llama cpp graph building.
+    // the savings were estimated as 110MB on a 72B model.
     ggml_tensor * tensors[TP_MAX_DEVICES];
 
     bool rejoined[TP_MAX_DEVICES];
@@ -66,22 +69,11 @@ struct ggml_tensor_parallel_extra {
     // flag for whether the tensors are split. split tensors will have a full tensor in converted_tensors.
     ggml_tp_split_type split_tensors;
 
-#if GGML_BACKEND_TP_VALIDATE
-    char *original_data;
-    size_t original_size;
-#endif
-
     // this tensor needs to be rejoined for another op.
     bool has_rejoin;
 
     // this tensor does not support split ops and has a src that needs to be rejoined.
     bool needs_src_rejoin;
-
-    // this tensor has been rejoined already for this forward pass.
-    // this property is reset every forward pass.
-    bool rejoined_to_buffer;
-    char * rejoined_buffer;
-    size_t rejoined_size;
 
     size_t rejoined_buft_offsets[TP_MAX_DEVICES];
 
@@ -100,11 +92,6 @@ struct ggml_tensor_parallel_extra {
         if (init_data) {
             free(init_data);
             init_data = nullptr;
-        }
-
-        if (rejoined_buffer) {
-            free(rejoined_buffer);
-            rejoined_buffer = nullptr;
         }
 
         for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
@@ -546,12 +533,7 @@ struct ggml_backend_tp_buffer_context {
     bool split = false;
     void * base_ptr;
 
-    // tensors with GGML_OP_NONE are never split and have full tensors on each device.
-    // these tensors may be used for input and may have set_tensor called on them.
-    size_t input_buffer_sizes[TP_MAX_DEVICES];
-    ggml_backend_buffer_t input_backend_buffers[TP_MAX_DEVICES];
-
-    // all other tensors are part of the pipeline and may be split or full.
+    // tensors are part of the pipeline and may be split or full.
     // this can not be determined until the graph is fully constructed.
     ggml_backend_buffer_t backend_buffers[TP_MAX_DEVICES];
 
@@ -570,12 +552,6 @@ struct ggml_backend_tp_buffer_context {
                 backend_buffers[i] = nullptr;
             }
 
-            backend_buffer = input_backend_buffers[i];
-            if (backend_buffer) {
-                backend_buffer->iface.free_buffer(backend_buffer);
-                input_backend_buffers[i] = nullptr;
-            }
-
             auto rejoined_buft = rejoined_bufts[i];
             if (rejoined_buft) {
                 rejoined_buft->iface.free_buffer(rejoined_buft);
@@ -591,13 +567,7 @@ struct ggml_backend_tp_buffer_context {
                 backend_buffer->iface.reset(backend_buffer);
             }
 
-            backend_buffer = input_backend_buffers[i];
-            if (backend_buffer && backend_buffer->iface.reset) {
-                backend_buffer->iface.reset(backend_buffer);
-            }
-
             rejoined_buft_sizes[i] = 0;
-            input_buffer_sizes[i] = 0;
         }
 
         for (auto & extra : extras) {
@@ -809,10 +779,6 @@ static void rejoin_tensor_data(const ggml_tensor * tensor, ggml_tensor_parallel_
         return;
     }
 
-    if (extra->rejoined_to_buffer) {
-        return;
-    }
-
     auto vs = tensor;
     while (vs->view_src) {
         vs = vs->view_src;
@@ -821,22 +787,7 @@ static void rejoin_tensor_data(const ggml_tensor * tensor, ggml_tensor_parallel_
     auto nb1 = vs->nb[1];
     auto split_nb1 = get_dim_splits(nb1);
 
-    if (data && extra->rejoined_to_buffer && extra->rejoined_buffer) {
-        memcpy(data, extra->rejoined_buffer, recombined_size);
-        return;
-    }
-
-    if (!data) {
-        if (!extra->rejoined_buffer || extra->rejoined_size < recombined_size) {
-            if (extra->rejoined_buffer) {
-                free(extra->rejoined_buffer);
-                extra->rejoined_buffer = nullptr;
-            }
-            extra->rejoined_buffer = (char *) malloc(recombined_size);
-            extra->rejoined_size = recombined_size;
-        }
-    }
-    auto rejoined_buffer = data ? data : extra->rejoined_buffer;
+    auto rejoined_buffer = data;
 
     // a tensor that is split across 4 devices can not be concatenated memorywise (rowwise).
     // rather, the tensors must be copied back in columnwise.
@@ -1901,11 +1852,6 @@ static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * te
 
             auto device_base_offset = device_blocks * device_alignment;
             wrapped->data = base + device_base_offset;
-
-            if (tensor->op == GGML_OP_NONE) {
-                auto alloc_size = backend_buffer->buft->iface.get_alloc_size(backend_buffer->buft, wrapped);
-                ctx->input_buffer_sizes[j] += alloc_size;
-            }
         }
         else {
             if (ctx->split) {
