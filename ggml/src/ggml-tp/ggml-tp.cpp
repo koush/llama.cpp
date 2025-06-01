@@ -179,10 +179,9 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
         unwrap_tensor(src, tensors);
     }
 
-    ggml_backend_tp_buffer_late_init_tensor(tensor);
-
     if (tensor->view_src) {
         auto view_src = tensor->view_src;
+        unwrap_tensor(view_src, tensors);
         auto view_src_extra = (ggml_tensor_parallel_extra *)view_src->extra;
         if (view_src_extra->has_rejoin) {
             for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -194,6 +193,8 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
             }
         }
     }
+
+    ggml_backend_tp_buffer_late_init_tensor(tensor);
 
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         auto src = tensor->src[i];
@@ -257,22 +258,21 @@ static void unwrap_tensor(ggml_tensor * tensor, std::set<ggml_tensor *> & tensor
                 else {
                     check = src_extra->tensors[j];
                 }
-
-                if (wrapped->src[i] != check) {
-                    int i =0;
-                }
             }
-            
+
+            if (i == 2 && tensor->op == GGML_OP_ROPE) {
+                wrapped->src[i] = src_extra->tensors[j];
+            }
 
             // mul mat may get two split tensors. when src0 is a weight can be multiplied
             // it multiplied as two split tensors and then sum reduced.
             // otherwise, the src1 tensors need to be rejoined and then multiplied.
             if (i == 1 && tensor->op == GGML_OP_MUL_MAT) {
                 if (src_extra->split_tensors && src_extra->has_rejoin) {
-                    wrapped->src[1] = src_extra->converted_tensors[j];
+                    wrapped->src[i] = src_extra->converted_tensors[j];
                 }
                 else {
-                    wrapped->src[1] = src_extra->tensors[j];
+                    wrapped->src[i] = src_extra->tensors[j];
                 }
             }
 
@@ -1948,6 +1948,12 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
     ggml_tensor_parallel_extra * extra = new ggml_tensor_parallel_extra();
     ctx->extras.push_back(extra);
     tensor->extra = extra;
+
+    if (tensor->view_src) {
+        // if this is a view tensor, it will be initialized later when the src is initialized.
+        // this is to avoid initializing the view tensor before the src is initialized.
+        return GGML_STATUS_SUCCESS;
+    }
 
     // tensors with ops will be initialized later when determining the graph state.
     // no-op tensors are always full tensors, and must be initialized immediately as they may be used as input or weights
