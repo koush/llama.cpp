@@ -739,12 +739,7 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     std::vector<cudaKernelNodeParams> params;
-    bool disable_due_to_gpu_arch = false;
-    bool disable_due_to_too_many_updates = false;
-    bool disable_due_to_failed_graph_capture = false;
-    int number_consecutive_updates = 0;
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
-    bool use_cpy_indirection = false;
     std::vector<char *> cpy_dest_ptrs;
     char ** dest_ptrs_d;
     int dest_ptrs_size = 0;
@@ -764,6 +759,12 @@ struct ggml_backend_cuda_context {
 
     std::unique_ptr<ggml_cuda_graph> cuda_graph;
     std::vector<ggml_cuda_graph *> cuda_graphs;
+    std::vector<ggml_cuda_graph *> active_graphs;
+    bool disable_due_to_gpu_arch = false;
+    bool disable_due_to_too_many_updates = false;
+    bool disable_due_to_failed_graph_capture = false;
+    int number_consecutive_updates = 0;
+    bool use_cpy_indirection = false;
 
     explicit ggml_backend_cuda_context(int device) :
         device(device),
@@ -787,6 +788,13 @@ struct ggml_backend_cuda_context {
         while (!cuda_graphs.empty()) {
             auto graph = cuda_graphs.back();
             cuda_graphs.pop_back();
+            if (graph != nullptr) {
+                delete graph;
+            }
+        }
+        while (!active_graphs.empty()) {
+            auto graph = active_graphs.back();
+            active_graphs.pop_back();
             if (graph != nullptr) {
                 delete graph;
             }

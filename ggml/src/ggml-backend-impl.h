@@ -124,9 +124,6 @@ extern "C" {
         // before calling the underlying 2d memcpy implementation.
         // TODO: add ggml 4d memcpy wrapper that uses 2d memcpy if available.
         bool (*cpy_tensor2d_async)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
-
-        // compute node (always async if supported by the backend)
-        enum ggml_status          (*node_compute)     (ggml_backend_t backend, struct ggml_tensor *node);
     };
 
     struct ggml_backend {

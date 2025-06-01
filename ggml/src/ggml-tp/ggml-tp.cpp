@@ -849,7 +849,7 @@ static void release_peers(struct compute_thread * thread) {
     }
 }
 
-static ggml_status reduce_gathered_tensors(int device_index, const ggml_tensor * tensor ) {
+static ggml_status reduce_gathered_tensors(ggml_cgraph * backend_graph, int device_index, const ggml_tensor * tensor) {
     auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
     if (extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
         return GGML_STATUS_SUCCESS;
@@ -867,18 +867,12 @@ static ggml_status reduce_gathered_tensors(int device_index, const ggml_tensor *
             wrapped->src[0] = extra->rejoined_tensor_views[device_index][i++];
             wrapped->src[1] = extra->rejoined_tensor_views[device_index][i];
             wrapped->op = GGML_OP_ADD;
-            auto status = be->iface.node_compute(be, wrapped);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
+            backend_graph->nodes[backend_graph->n_nodes++] = wrapped;
             continue;
         }
         wrapped->src[0] = wrapped;
         wrapped->src[1] = extra->rejoined_tensor_views[device_index][i];
-        auto status = be->iface.node_compute(be, wrapped);
-        if (status != GGML_STATUS_SUCCESS) {
-            return status;
-        }
+        backend_graph->nodes[backend_graph->n_nodes++] = wrapped;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -973,7 +967,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
         // once all peers are done, we can rejoin the tensors
         for (auto & pending : pending_rejoins) {
-            reduce_gathered_tensors(device_index, pending);
+            reduce_gathered_tensors(backend_graph, device_index, pending);
             auto pending_extra = (ggml_tensor_parallel_extra *)pending->extra;
             pending_extra->rejoined[device_index] = true;
         }
@@ -1278,7 +1272,6 @@ static ggml_backend_i ggml_backend_tp_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_tp_graph_compute,
-    /* .node_compute            = */ NULL,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
 };

@@ -2636,7 +2636,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
     }
 
     if (use_cuda_graph) {
-        cuda_ctx->cuda_graph->use_cpy_indirection = true;
+        cuda_ctx->use_cpy_indirection = true;
         // copy pointers to GPU so they can be accessed via indirection within CUDA graph
         ggml_cuda_cpy_dest_ptrs_copy(cuda_ctx->cuda_graph.get(), cuda_ctx->cuda_graph->cpy_dest_ptrs.data(), cuda_ctx->cuda_graph->cpy_dest_ptrs.size(), cuda_ctx->stream());
     }
@@ -2838,15 +2838,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef USE_CUDA_GRAPH
     static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
 
+    bool first_run = cuda_ctx->cuda_graph == nullptr;
     // Objects required for CUDA Graph
-    if (cuda_ctx->cuda_graph == nullptr) {
+    if (first_run) {
         cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
     }
 
     // the input node may change to a different address in layer split
     // mode which cuases the graph to be invalidated. cache some number of graphs
     // and search them all.
-    while (cuda_ctx->cuda_graphs.size() < 4) {
+    while (cuda_ctx->cuda_graphs.size() + cuda_ctx->active_graphs.size() < 320) {
         cuda_ctx->cuda_graphs.emplace_back(new ggml_cuda_graph());
     }
 
@@ -2855,7 +2856,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     if (cuda_ctx->cuda_graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
-            cuda_ctx->cuda_graph->disable_due_to_gpu_arch = true;
+            cuda_ctx->disable_due_to_gpu_arch = true;
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
 #endif
@@ -2866,32 +2867,69 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // or previous graph capture failure.
     // Also disable for multi-gpu for now. TO DO investigate
     if (disable_cuda_graphs_due_to_env
-        || cuda_ctx->cuda_graph->disable_due_to_gpu_arch
-        || cuda_ctx->cuda_graph->disable_due_to_too_many_updates
-        || cuda_ctx->cuda_graph->disable_due_to_failed_graph_capture) {
+        || cuda_ctx->disable_due_to_gpu_arch
+        || cuda_ctx->disable_due_to_too_many_updates
+        || cuda_ctx->disable_due_to_failed_graph_capture) {
         use_cuda_graph = false;
     }
 
     if (use_cuda_graph) {
-        // find a matching graph, testing most recent one first, then check lru
-        if (is_cuda_graph_update_required(cuda_ctx, cgraph, cuda_ctx->cuda_graph.get(), false)) {
-            for (size_t graph_index = 0; graph_index < cuda_ctx->cuda_graphs.size(); graph_index++) {
-                auto cuda_graph = cuda_ctx->cuda_graphs[graph_index];
+        // in tensor parallelism the graph splits on every gather, this results in a ~100-200 graphs being needed.
+        // they are used in a deterministic order, so the goal is to create a list of graphs
+        // that can be cycled through.
+        // when cycling through the tp splits, check the first item in the active list. if it matches,
+        // the graphs are in a deterministic order. if it does not match, its expected that no
+        // graph in the active list will match. this means that the active list is still building.
+        // if the list does have a match, clear everything and start over.
 
-                if (graph_index == cuda_ctx->cuda_graphs.size() - 1) {
-                    cuda_ctx->cuda_graphs.erase(cuda_ctx->cuda_graphs.begin() + graph_index);
-                    cuda_graph_update_required = is_cuda_graph_update_required(cuda_ctx, cgraph, cuda_graph, true);
-                    ggml_cuda_graph * existing = cuda_ctx->cuda_graph.release();
-                    cuda_ctx->cuda_graph.reset(cuda_graph);
-                    cuda_ctx->cuda_graphs.insert(cuda_ctx->cuda_graphs.begin(), existing);
-                    break;
-                } else if (!is_cuda_graph_update_required(cuda_ctx, cgraph, cuda_graph, false)) {
-                    cuda_ctx->cuda_graphs.erase(cuda_ctx->cuda_graphs.begin() + graph_index);
-                    ggml_cuda_graph * existing = cuda_ctx->cuda_graph.release();
-                    cuda_ctx->cuda_graph.reset(cuda_graph);
-                    cuda_ctx->cuda_graphs.insert(cuda_ctx->cuda_graphs.begin(), existing);
-                    break;
+        // early out for non-tp usage.
+        if (is_cuda_graph_update_required(cuda_ctx, cgraph, cuda_ctx->cuda_graph.get(), false)) {
+            bool found = false;
+
+            for (size_t i = 0; i < cuda_ctx->active_graphs.size(); i++) {
+                ggml_cuda_graph * cuda_graph = cuda_ctx->active_graphs[i];
+                if (!is_cuda_graph_update_required(cuda_ctx, cgraph, cuda_graph, false)) {
+                    if (i == 0) {
+                        found = true;
+                        break;
+                    }
+                    else {
+                        cuda_ctx->cuda_graphs.insert(cuda_ctx->cuda_graphs.end(), std::make_move_iterator(cuda_ctx->active_graphs.begin()), std::make_move_iterator(cuda_ctx->active_graphs.end()));
+                        cuda_ctx->active_graphs.clear();
+                        break;
+                    }
                 }
+            }
+
+            if (!found) {
+                // sequence too long, start over.
+                if (cuda_ctx->cuda_graphs.empty() || first_run) {
+                    cuda_ctx->cuda_graphs.insert(cuda_ctx->cuda_graphs.end(), std::make_move_iterator(cuda_ctx->active_graphs.begin()), std::make_move_iterator(cuda_ctx->active_graphs.end()));
+                }
+                else {
+                    // graphs may still be building. grab an available graph.
+                    auto cuda_graph = *(cuda_ctx->cuda_graphs.end() - 1);
+                    cuda_ctx->cuda_graphs.pop_back();
+
+                    // push current onto active list.
+                    auto existing = cuda_ctx->cuda_graph.release();
+                    cuda_ctx->active_graphs.push_back(existing);
+                    cuda_ctx->cuda_graph.reset(cuda_graph);
+                }
+
+                // use whatever is in cuda_ctx->cuda_graph
+                cuda_graph_update_required = is_cuda_graph_update_required(cuda_ctx, cgraph, cuda_ctx->cuda_graph.get(), true);
+            }
+            else {
+                // graphs are cycling. move the active one to current, and push the current onto the active list.
+                auto cuda_graph = *(cuda_ctx->active_graphs.begin());
+                // erase first
+                cuda_ctx->active_graphs.erase(cuda_ctx->active_graphs.begin());
+
+                // push current onto active list.
+                auto existing = cuda_ctx->cuda_graph.release();
+                cuda_ctx->active_graphs.push_back(existing);
+                cuda_ctx->cuda_graph.reset(cuda_graph);
             }
         }
 
@@ -2899,13 +2937,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
         // Disable CUDA graphs (from the next token) if the use-case is demanding too many consecutive graph updates.
         if (use_cuda_graph && cuda_graph_update_required) {
-            cuda_ctx->cuda_graph->number_consecutive_updates++;
+            cuda_ctx->number_consecutive_updates++;
         } else {
-            cuda_ctx->cuda_graph->number_consecutive_updates = 0;
+            cuda_ctx->number_consecutive_updates = 0;
         }
 
-        if (cuda_ctx->cuda_graph->number_consecutive_updates >= 4) {
-            cuda_ctx->cuda_graph->disable_due_to_too_many_updates = true;
+        if (cuda_ctx->number_consecutive_updates >= 1000 && false) {
+            cuda_ctx->disable_due_to_too_many_updates = true;
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to too many consecutive updates\n", __func__);
 #endif
@@ -2917,7 +2955,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     if (!use_cuda_graph) {
-        cuda_ctx->cuda_graph->use_cpy_indirection = false;
+        cuda_ctx->use_cpy_indirection = false;
     }
 
 #else
@@ -2966,26 +3004,6 @@ static void ggml_backend_cuda_set_tensor2d_async(ggml_backend_t backend, ggml_te
     CUDA_CHECK(cudaMemcpy2DAsync(tensor->data, tensor->nb[1], data, stride, width, height, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
-static enum ggml_status ggml_backend_cuda_node_compute(ggml_backend_t backend, ggml_tensor* node) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
-
-    ggml_cuda_set_device(cuda_ctx->device);
-#ifdef USE_CUDA_GRAPH
-    // Objects required for CUDA Graph
-    if (cuda_ctx->cuda_graph == nullptr) {
-        cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
-    }
-    cuda_ctx->cuda_graph->use_cpy_indirection = false;
-#endif
-
-    bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
-    if (!ok) {
-        GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
-    }
-    GGML_ASSERT(ok);
-    return GGML_STATUS_SUCCESS;
-}
-
 static bool ggml_backend_cuda_cpy_tensor2d_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     return ggml_backend_cuda_cpy_tensor2d_async_common(backend_src, backend_dst, src, dst, false);
 }
@@ -3007,7 +3025,6 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .set_tensor2d_async      = */ ggml_backend_cuda_set_tensor2d_async,
     /* .get_tensor2d_async      = */ NULL,
     /* .cpy_tensor2d_async      = */ ggml_backend_cuda_cpy_tensor2d_async,
-    /* .node_compute            = */ ggml_backend_cuda_node_compute,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
