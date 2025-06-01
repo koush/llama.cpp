@@ -2494,6 +2494,7 @@ static bool ggml_backend_cuda_cpy_tensor2d_async_common(ggml_backend_t backend_s
     bool is_1d = force_1d;
     ggml_2d_cpy_t src_pitch;
     ggml_2d_cpy_t dst_pitch;
+    cudaStream_t stream;
 
     if (!force_1d) {
         src_pitch = ggml_backend_cuda_2d_pitch(src);
@@ -2532,32 +2533,36 @@ static bool ggml_backend_cuda_cpy_tensor2d_async_common(ggml_backend_t backend_s
     cudaMemcpyKind kind = cudaMemcpyDefault;
 
     if (backend_src == backend_dst) {
-        kind = cudaMemcpyDeviceToDevice;     
-    }
-    else if (!src_is_cuda) {
+        kind = cudaMemcpyDeviceToDevice;
+        stream = cuda_ctx_src->stream();
+    } else if (!src_is_cuda) {
         kind = cudaMemcpyHostToDevice; // copy from host to device
+        stream = cuda_ctx_dst->stream();
     } else if (!dst_is_cuda) {
         kind = cudaMemcpyDeviceToHost; // copy from device to host
+        stream = cuda_ctx_src->stream();
     } else if (cuda_ctx_src->device == cuda_ctx_dst->device) {
         kind = cudaMemcpyDeviceToDevice; // copy from device to device
+        stream = cuda_ctx_src->stream();
     }
     else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+        stream = cuda_ctx_src->stream();
         if (is_1d) {
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), stream));
         } else {
-            CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(dst->data, cuda_ctx_dst->device, dst_pitch.pitch, src->data, cuda_ctx_src->device, src_pitch.pitch, src_pitch.width, src_pitch.height, cuda_ctx_src->stream()));
+            CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(dst->data, cuda_ctx_dst->device, dst_pitch.pitch, src->data, cuda_ctx_src->device, src_pitch.pitch, src_pitch.width, src_pitch.height, stream));
         }
 #endif
     }
 
     if (kind != cudaMemcpyDefault) {
         if (is_1d) {
-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), kind, cuda_ctx_src->stream()));
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), kind, stream));
         } else {
-            CUDA_CHECK(cudaMemcpy2DAsync(dst->data, dst_pitch.pitch, src->data, src_pitch.pitch, src_pitch.width, src_pitch.height, kind, cuda_ctx_src->stream()));
+            CUDA_CHECK(cudaMemcpy2DAsync(dst->data, dst_pitch.pitch, src->data, src_pitch.pitch, src_pitch.width, src_pitch.height, kind, stream));
         }
     }
 
