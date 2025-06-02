@@ -888,7 +888,7 @@ static ggml_tensor* ggml_backend_tp_node_compute_split(int device_index, ggml_te
 }
 
 static bool immediate_compute = false;
-static void ggml_backend_tp_buffer_walk_graph(ggml_cgraph * cgraph, std::function<bool(int, std::set<ggml_tensor*>)> gather_pending, std::function<bool(int, ggml_tensor *, ggml_tensor_parallel_extra *)> compute) {
+static void ggml_backend_tp_buffer_compute_graph(ggml_cgraph * cgraph, std::function<bool(int, std::set<ggml_tensor*>)> gather_pending, std::function<bool(int, ggml_tensor *, ggml_tensor_parallel_extra *)> compute) {
     std::set<ggml_tensor*> pending_gathers;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
         auto tensor = cgraph->nodes[node_index];
@@ -1003,7 +1003,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         return true;
     };
 
-    ggml_backend_tp_buffer_walk_graph(cgraph, gather_pending, compute);
+    ggml_backend_tp_buffer_compute_graph(cgraph, gather_pending, compute);
     flush_compute(cgraph->n_nodes);
 
     thread->done.unlock();
@@ -1047,7 +1047,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         return true;
     };
 
-    ggml_backend_tp_buffer_walk_graph(cgraph, prepare_gather, [&](int node_index, ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
+    ggml_backend_tp_buffer_compute_graph(cgraph, prepare_gather, [&](int node_index, ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
         if (!extra->has_rejoin) {
             return true;
         }
