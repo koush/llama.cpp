@@ -889,17 +889,17 @@ static ggml_tensor* ggml_backend_tp_node_compute_split(int device_index, ggml_te
 
 static bool immediate_compute = false;
 static void ggml_backend_tp_buffer_walk_graph(ggml_cgraph * cgraph, std::function<bool(int, std::set<ggml_tensor*>)> gather_pending, std::function<bool(int, ggml_tensor *, ggml_tensor_parallel_extra *)> compute) {
-    std::set<ggml_tensor*> pending_rejoins;
+    std::set<ggml_tensor*> pending_gathers;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
         auto tensor = cgraph->nodes[node_index];
         auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
         // wait for async memcpy to finish if needed
-        if ((extra->needs_src_rejoin || immediate_compute) && pending_rejoins.size()) {
-            if (!gather_pending(node_index, pending_rejoins)) {
+        if ((extra->needs_src_rejoin || immediate_compute) && pending_gathers.size()) {
+            if (!gather_pending(node_index, pending_gathers)) {
                 return;
             }
-            pending_rejoins.clear();
+            pending_gathers.clear();
         }
 
         if (!compute(node_index, tensor, extra)) {
@@ -907,7 +907,7 @@ static void ggml_backend_tp_buffer_walk_graph(ggml_cgraph * cgraph, std::functio
         }
 
         if (extra->has_rejoin) {
-            pending_rejoins.insert(tensor);
+            pending_gathers.insert(tensor);
         }
     }
 }
@@ -940,10 +940,10 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         thread->end = node_index;
     };
 
-    auto gather_pending = [&](int node_index, std::set<ggml_tensor*> pending_rejoins) {
+    auto gather_pending = [&](int node_index, std::set<ggml_tensor*> pending_gathers) {
         flush_compute(node_index);
 
-        for (auto & tensor : pending_rejoins) {
+        for (auto & tensor : pending_gathers) {
             auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
             auto wrapped = extra->tensors[device_index];
 
@@ -982,12 +982,12 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         }
 
         // once all peers are done, we can rejoin the tensors
-        for (auto & pending : pending_rejoins) {
+        for (auto & pending : pending_gathers) {
             reduce_gathered_tensors(backend_graph, device_index, pending);
             auto pending_extra = (ggml_tensor_parallel_extra *)pending->extra;
             pending_extra->rejoined[device_index] = true;
         }
-        pending_rejoins.clear();
+        pending_gathers.clear();
         return true;
     };
 
@@ -1034,9 +1034,9 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     size_t rejoined_buft_sizes_max[TP_MAX_DEVICES] = { 0 };
     size_t rejoined_buft_sizes_cur[TP_MAX_DEVICES] = { 0 };
 
-    auto prepare_gather = [&](int node_index, std::set<ggml_tensor*> pending_rejoins) {
-        gather_stages.push_back(std::set<ggml_tensor *>(pending_rejoins));
-        for (auto & tensor : pending_rejoins) {
+    auto prepare_gather = [&](int node_index, std::set<ggml_tensor*> pending_gathers) {
+        gather_stages.push_back(std::set<ggml_tensor *>(pending_gathers));
+        for (auto & tensor : pending_gathers) {
             for (size_t device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
                 rejoined_buft_sizes_max[device_index] = std::max(rejoined_buft_sizes_max[device_index], rejoined_buft_sizes_cur[device_index]);
             }
