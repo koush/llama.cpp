@@ -47,6 +47,7 @@ enum ggml_tp_split_type {
     GGML_TP_SPLIT_COLUMNS = 2,
     GGML_TP_SPLIT_REDUCE = 3,
     GGML_TP_SPLIT_DIM2 = 4,
+    GGML_TP_SPLIT_VIEW = 5,
 };
 
 struct ggml_tensor_parallel_extra {
@@ -1089,7 +1090,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
         }
     };
 
-    auto create_row_split_tensors = [&]() {
+    auto create_row_split_tensors_for = [](ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
         extra->split_tensors = GGML_TP_SPLIT_ROWS;
         auto splits = get_row_splits(tensor);
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -1103,6 +1104,10 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             wrapped->nb[2] = wrapped->nb[2] / tensor->ne[1] * splits.split[j];
             wrapped->nb[3] = wrapped->nb[3] / tensor->ne[1] * splits.split[j];
         }
+    };
+
+    auto create_row_split_tensors = [&]() {
+        create_row_split_tensors_for(tensor, extra);
     };
 
     auto create_column_split_tensors = [&]() {
@@ -1212,6 +1217,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
 
             if (split == GGML_TP_SPLIT_NONE) {
                 if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+                    ensure_reduce_split_views(tensor->src[src_index]);
                     wrapped->src[src_index] = src_extra->reduce_split_views[j];
                 }
                 else if (src_extra->split_tensors) {
@@ -1237,6 +1243,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                     wrapped->src[src_index] = src_extra->tensors[j];
                 }
                 else if (src_extra->split_tensors) {
+                    ensure_reduce_split_views(tensor->src[src_index]);
                     wrapped->src[src_index] = src_extra->reduce_split_views[j];
                 }
                 else {
@@ -1266,18 +1273,37 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
 
     switch (tensor->op) {
         case GGML_OP_ROPE: {
-            no_split_view(src0, src0_extra);
             if (tensor->view_src) {
                 GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
             }
 
-            if (src0_extra->split_tensors && src0_extra->split_tensors != GGML_TP_SPLIT_COLUMNS) {
-                GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but not as columns.\n", tensor->name, ggml_op_name(tensor->op));
-                // technically, this is not a problem, but it is not expected.
-                // ensure_rejoined(tensor, src0);
-            }
-
             auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
+
+            if (src0_split_tensors == GGML_TP_SPLIT_VIEW) {
+                // make this into columns and create views into it
+                auto src0_viewsrc = src0->view_src;
+                auto src0_viewsrc_extra = (ggml_tensor_parallel_extra *)src0_viewsrc->extra;
+                if (src0_viewsrc_extra->split_tensors != GGML_TP_SPLIT_COLUMNS) {
+                    GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but not as columns.\n", tensor->name, ggml_op_name(tensor->op));
+                }
+                
+                if (src0_viewsrc->ne[0] % tensor->ne[0]) {
+                    GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split as view but not evenly divisible by the rope head count.\n", tensor->name, ggml_op_name(tensor->op));
+                }
+
+                if (src0_extra->tensors[0]) {
+                    GGML_ABORT("Reshape Tensor %s has already been initialized, but is being initialized again.\n", tensor->name);
+                }
+
+                // rope input is initially on columns.
+                // input to rope is split [8192,1,1,1], per gpu it is [4096,1,1,1]
+                // the input is then reshaped [128,64,1,1] per gpu it is [128,32,1,1]
+                // this effectively splits it on the num heads 64->32 heads.
+                // the output from rope is [128,64,1,1] per gpu it is [128,32,1,1]
+                // this means that the rope output is now split on rows.
+                src0_split_tensors = GGML_TP_SPLIT_ROWS;
+                create_row_split_tensors_for(src0, src0_extra);
+            }
 
             if (!src0_split_tensors) {
                 create_default_tensors();
@@ -1287,23 +1313,29 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                     set_src_tensor(2, GGML_TP_SPLIT_NONE);
                 }
             }
-            else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS) {
-                // rope input is initially on columns.
-                // input to rope is split [8192,1,1,1], per gpu it is [4096,1,1,1]
-                // rope is then reshaped [128,64,1,1] per gpu it is [128,32,1,1]
-                // this effectively splits it on the head dim 64->32 heads.
-                // the output from rope is [128,64,1,1] per gpu it is [128,32,1,1]
-                // this means that the rope output is now split on rows.
-                GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split as columns.\n", tensor->name, ggml_op_name(tensor->op));
+            else if (src0_split_tensors == GGML_TP_SPLIT_ROWS) {
+                create_row_split_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                set_src_tensor(1, GGML_TP_SPLIT_NONE);
             }
             else {
-                GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but not as columns.\n", tensor->name, ggml_op_name(tensor->op));
+                GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but not as rows.\n", tensor->name, ggml_op_name(tensor->op));
+                // technically, this is not a problem, but it is not expected.
+                // ensure_rejoined(tensor, src0);
             }
 
             break;
         }
 
         case GGML_OP_FLASH_ATTN_EXT: {
+            no_split_view(src0, src0_extra);
+            no_split_view(src1, src1_extra);
+            no_split_view(src2, src2_extra);
+            no_split_view(src3, src3_extra);
+            if (tensor->view_src) {
+                GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
+            }
+
             auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
             auto src1_split_tensors = src1_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src1_extra->split_tensors;
             auto src2_split_tensors = src2_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src2_extra->split_tensors;
@@ -1334,6 +1366,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             if (tensor->view_src) {
                 GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
             }
+
             ensure_rejoined(tensor, src0);
             create_default_tensors();
             set_src_tensor(0, GGML_TP_SPLIT_NONE);
@@ -1355,7 +1388,12 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                 create_reduce_tensors();
                 create_reduce_op_tensors();
             }
-            else if (src0_split_tensors & !src1_split_tensors) {
+            else if (!src0_split_tensors && !src1_split_tensors) {
+                create_default_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_NONE);
+                set_src_tensor(1, GGML_TP_SPLIT_NONE);
+            }
+            else if ((src0_split_tensors ^ src1_split_tensors) || (src0_split_tensors == src1_split_tensors)) {
                 auto split_tensors = src0_split_tensors ? src0_split_tensors : src1_split_tensors;
 
                 if (split_tensors == GGML_TP_SPLIT_COLUMNS) {
@@ -1398,6 +1436,11 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
         }
 
         case GGML_OP_UNARY: {
+            no_split_view(src0, src0_extra);
+            if (tensor->view_src) {
+                GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
+            }
+
             no_reduce(src0, src0_extra);
             auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
 
@@ -1565,6 +1608,12 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
         }
 
         case GGML_OP_GET_ROWS: {
+            no_split_view(src0, src0_extra);
+            no_split_view(src1, src1_extra);
+            if (tensor->view_src) {
+                GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
+            }
+
             auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
             if (src0_split_tensors == GGML_TP_SPLIT_ROWS) {
                 GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split as rows.\n", tensor->name, ggml_op_name(tensor->op));
@@ -1572,26 +1621,37 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             }
             else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS) {
                 create_column_split_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
             }
             else if (!src0_split_tensors) {
                 create_default_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_NONE);
             }
             else if (src0_split_tensors == GGML_TP_SPLIT_REDUCE) {
                 // this actually works out just fine because the rows can be gotten then added together.
                 create_reduce_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_REDUCE);
             }
             else {
                 GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but not as columns or rows.\n", tensor->name, ggml_op_name(tensor->op));
             }
+            set_src_tensor(1, GGML_TP_SPLIT_NONE);
+            check_srcs();
             break;
         }
 
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_RESHAPE: {
+            auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
             // if split, skip, make the downstream op make sense of it, as some graphs combine a bunch of reshapes/permutes/views.
-            if (!extra->split_tensors) {
+            if (!src0_split_tensors) {
                 create_default_tensors();
+            }
+            else {
+                GGML_LOG_WARN("Tensor %s has unsupported op %s for tensor parallelism, src0 is split.\n", tensor->name, ggml_op_name(tensor->op));
+                has_init = true;
+                extra->split_tensors = GGML_TP_SPLIT_VIEW;
             }
             break;
         }
