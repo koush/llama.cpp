@@ -908,7 +908,8 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         /* .mem_buffer = */ NULL,
         /* .no_alloc   = */ true
     };
-    struct ggml_context * ctx = ggml_init(params);
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    auto ctx = ctx_ptr.get();
     struct ggml_cgraph * backend_graph = ggml_new_graph_custom(ctx, cgraph->size, false);
     auto device_index = thread->device_index;
     auto be = ggml_parallel_backends[device_index];
@@ -1475,14 +1476,11 @@ static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * te
     }
     extra->initialized = true;
 
-    ggml_backend_buffer_t buffer = tensor->buffer;
-
     // determine whether this tensor op results in a split output.
     // this may be due to the weights themselves being split, or the tensor being a result of
     // a split compatible operation on a split src tensor.
     auto split_from_src = false;
     auto split_reduced_add = false;
-
 
     // check all src tensors to see if this tensor is split or the src tensors need a rejoin
     auto tensor_is_split_compatible = is_split_compatible(tensor);
