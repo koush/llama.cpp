@@ -72,8 +72,8 @@ struct ggml_tensor_parallel_extra {
     // this tensor does not support split ops and has a src that needs to be rejoined.
     bool needs_src_rejoin;
 
-    size_t rejoined_buft_sizes[TP_MAX_DEVICES];
-    size_t rejoined_buft_offsets[TP_MAX_DEVICES];
+    size_t gather_buft_sizes[TP_MAX_DEVICES];
+    size_t gather_buft_offsets[TP_MAX_DEVICES];
 
     // holds either split tensor views or full rejoined tensors depending on the owning tensor.
     ggml_tensor * converted_tensors[TP_MAX_DEVICES];
@@ -522,8 +522,8 @@ struct ggml_backend_tp_buffer_context {
 
     // todo: switch from extra pointer to actually allocating the extra and referencing within the vector.
     std::vector<ggml_tensor_parallel_extra *> extras;
-    size_t rejoined_buft_sizes[TP_MAX_DEVICES];
-    ggml_backend_buffer_t rejoined_bufts[TP_MAX_DEVICES];
+    size_t gather_buft_sizes[TP_MAX_DEVICES];
+    ggml_backend_buffer_t gather_bufts[TP_MAX_DEVICES];
 
     ~ggml_backend_tp_buffer_context() {
         reset();
@@ -535,10 +535,10 @@ struct ggml_backend_tp_buffer_context {
                 backend_buffers[i] = nullptr;
             }
 
-            auto rejoined_buft = rejoined_bufts[i];
-            if (rejoined_buft) {
-                rejoined_buft->iface.free_buffer(rejoined_buft);
-                rejoined_bufts[i] = nullptr;
+            auto gather_buft = gather_bufts[i];
+            if (gather_buft) {
+                gather_buft->iface.free_buffer(gather_buft);
+                gather_bufts[i] = nullptr;
             }
         }
     }
@@ -550,7 +550,7 @@ struct ggml_backend_tp_buffer_context {
                 backend_buffer->iface.reset(backend_buffer);
             }
 
-            rejoined_buft_sizes[i] = 0;
+            gather_buft_sizes[i] = 0;
         }
 
         for (auto & extra : extras) {
@@ -560,7 +560,7 @@ struct ggml_backend_tp_buffer_context {
     }
 
     ggml_status allocate_rejoin_buffer(size_t device_index, size_t rejoin_buft_size) {
-        auto rejoin_buft = rejoined_bufts[device_index];
+        auto rejoin_buft = gather_bufts[device_index];
         if (rejoin_buft && rejoin_buft->size < rejoin_buft_size) {
             rejoin_buft->iface.free_buffer(rejoin_buft);
             rejoin_buft = nullptr;
@@ -574,7 +574,7 @@ struct ggml_backend_tp_buffer_context {
                 GGML_LOG_ERROR("Failed to allocate rejoin buffer %zu\n", device_index);
                 return GGML_STATUS_FAILED;
             }
-            rejoined_bufts[device_index] = rejoin_buft;
+            gather_bufts[device_index] = rejoin_buft;
         }
         return GGML_STATUS_SUCCESS;
     }
@@ -647,7 +647,7 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
 
         ggml_tensor * rejoined = ggml_backend_tp_clone_tensor(src);
         src_extra->converted_tensors[j] = rejoined;
-        src_extra->rejoined_buft_sizes[j] = aligned_size;
+        src_extra->gather_buft_sizes[j] = aligned_size;
 
         // since this is an input, rewrite the op.
         rejoined->op = GGML_OP_NONE;
@@ -1031,18 +1031,18 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     // this must happen on main thread to prevent race conditions on gather tensor setup.
     auto gather_ctx = (ggml_backend_tp_buffer_context *)cgraph->nodes[cgraph->n_nodes - 1]->buffer->context;
     std::vector<std::set<ggml_tensor *>> gather_stages;
-    size_t rejoined_buft_sizes_max[TP_MAX_DEVICES] = { 0 };
-    size_t rejoined_buft_sizes_cur[TP_MAX_DEVICES] = { 0 };
+    size_t gather_buft_sizes_max[TP_MAX_DEVICES] = { 0 };
+    size_t gather_buft_sizes_cur[TP_MAX_DEVICES] = { 0 };
 
     auto prepare_gather = [&](int node_index, std::set<ggml_tensor*> pending_gathers) {
         gather_stages.push_back(std::set<ggml_tensor *>(pending_gathers));
         for (auto & tensor : pending_gathers) {
             for (size_t device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
-                rejoined_buft_sizes_max[device_index] = std::max(rejoined_buft_sizes_max[device_index], rejoined_buft_sizes_cur[device_index]);
+                gather_buft_sizes_max[device_index] = std::max(gather_buft_sizes_max[device_index], gather_buft_sizes_cur[device_index]);
             }
         }
         for (size_t i = 0; i < TP_MAX_DEVICES; i++) {
-            rejoined_buft_sizes_cur[i] = 0;
+            gather_buft_sizes_cur[i] = 0;
         }
         return true;
     };
@@ -1053,8 +1053,8 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         }
 
         for (size_t device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
-            extra->rejoined_buft_offsets[device_index] = rejoined_buft_sizes_cur[device_index];
-            rejoined_buft_sizes_cur[device_index] += extra->rejoined_buft_sizes[device_index];
+            extra->gather_buft_offsets[device_index] = gather_buft_sizes_cur[device_index];
+            gather_buft_sizes_cur[device_index] += extra->gather_buft_sizes[device_index];
         }
         return true;
     });
@@ -1062,9 +1062,9 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
     // allocate the gather buffers
     for (size_t device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
         // double the gather size to account for both input and output gather tensors
-        auto status = gather_ctx->allocate_rejoin_buffer(device_index, rejoined_buft_sizes_max[device_index] * 2);
+        auto status = gather_ctx->allocate_rejoin_buffer(device_index, gather_buft_sizes_max[device_index] * 2);
         if (status != GGML_STATUS_SUCCESS) {
-            GGML_ABORT("Failed to allocate gather buffer for device %d with size %zu\n", device_index, rejoined_buft_sizes_max[device_index]);
+            GGML_ABORT("Failed to allocate gather buffer for device %d with size %zu\n", device_index, gather_buft_sizes_max[device_index]);
         }
     }
 
@@ -1078,13 +1078,13 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
                 auto rejoined = extra->converted_tensors[device_index];
 
                 auto ctx = (ggml_backend_tp_buffer_context *)tensor->buffer->context;
-                auto rejoin_buft = ctx->rejoined_bufts[device_index];
+                auto rejoin_buft = ctx->gather_bufts[device_index];
                 auto rejoined_buft_base = (char *)rejoin_buft->iface.get_base(rejoin_buft);
                 size_t stage_offset = 0;
                 if (stage % 2) {
-                    stage_offset = rejoined_buft_sizes_max[device_index];
+                    stage_offset = gather_buft_sizes_max[device_index];
                 }
-                rejoined->data = (char *)rejoin_buft->iface.get_base(rejoin_buft) + extra->rejoined_buft_offsets[device_index] + stage_offset;
+                rejoined->data = (char *)rejoin_buft->iface.get_base(rejoin_buft) + extra->gather_buft_offsets[device_index] + stage_offset;
 
                 if (!rejoined->buffer) {
                     rejoined->buffer = rejoin_buft;
