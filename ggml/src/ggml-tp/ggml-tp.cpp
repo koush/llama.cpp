@@ -1476,7 +1476,6 @@ static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * te
     extra->initialized = true;
 
     ggml_backend_buffer_t buffer = tensor->buffer;
-    ggml_backend_tp_buffer_context * ctx = (ggml_backend_tp_buffer_context *)buffer->context;
 
     // determine whether this tensor op results in a split output.
     // this may be due to the weights themselves being split, or the tensor being a result of
@@ -1499,7 +1498,7 @@ static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * te
             ensure_rejoined(tensor, src);
         }
     }
-    else if (!ctx->split) {
+    else {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = tensor->src[i];
             if (!src) {
@@ -1607,10 +1606,7 @@ static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * te
         }
     }
 
-    if (ctx->split) {
-        extra->split_tensors = GGML_TP_SPLIT_ROWS;
-    }
-    else if (split_from_src) {
+    if (split_from_src) {
         if (extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
             // no-op
         }
