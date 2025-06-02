@@ -2878,6 +2878,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // or previous graph capture failure.
     // Also disable for multi-gpu for now. TO DO investigate
     if (disable_cuda_graphs_due_to_env
+        || cgraph->n_nodes == 1
         || cuda_ctx->disable_due_to_gpu_arch
         || cuda_ctx->disable_due_to_too_many_updates
         || cuda_ctx->disable_due_to_failed_graph_capture) {
