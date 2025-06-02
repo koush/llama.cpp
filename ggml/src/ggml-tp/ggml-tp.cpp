@@ -18,6 +18,7 @@
 #include <numeric>
 #include <set>
 #include <thread>
+#include <functional>
 
 #define NUM_DEVICES 1
 // #define GGML_BACKEND_TP_VALIDATE 1
@@ -886,6 +887,30 @@ static ggml_tensor* ggml_backend_tp_node_compute_split(int device_index, ggml_te
     return reduce_op_tensor;
 }
 
+static void ggml_backend_tp_buffer_walk_graph(ggml_cgraph * cgraph, std::function<bool(int, std::set<ggml_tensor*>)> gather_pending, std::function<bool(int, ggml_tensor *, ggml_tensor_parallel_extra *)> compute) {
+    std::set<ggml_tensor*> pending_rejoins;
+    for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
+        auto tensor = cgraph->nodes[node_index];
+        auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+
+        // wait for async memcpy to finish if needed
+        if (extra->needs_src_rejoin && pending_rejoins.size()) {
+            if (!gather_pending(node_index, pending_rejoins)) {
+                return;
+            }
+            pending_rejoins.clear();
+        }
+
+        if (!compute(node_index, tensor, extra)) {
+            return;
+        }
+
+        if (extra->has_rejoin) {
+            pending_rejoins.insert(tensor);
+        }
+    }
+}
+
 static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thread) {
     auto startTime = std::chrono::high_resolution_clock::now();
     auto cgraph = thread->cgraph;
@@ -901,14 +926,20 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     auto device_index = thread->device_index;
     auto be = ggml_parallel_backends[device_index];
 
-    std::set<ggml_tensor*> pending_rejoins;
+    ;
     int rejoins = 0;
-
-    auto gather_pending = [&](int node_index) {
+    
+    auto flush_compute = [&](int node_index) {
         auto status = be->iface.graph_compute(be, backend_graph);
         if (status != GGML_STATUS_SUCCESS) {
             GGML_ABORT("Backend %s failed to compute graph %d with status %d\n", be->iface.get_name(be), node_index, status);
         }
+        backend_graph->n_nodes = 0;
+        thread->end = node_index;
+    };
+
+    auto gather_pending = [&](int node_index, std::set<ggml_tensor*> pending_rejoins) {
+        flush_compute(node_index);
 
         for (auto & tensor : pending_rejoins) {
             auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
@@ -938,8 +969,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             }
         }
 
-        thread->end = node_index;
-        backend_graph->n_nodes = 0;
         rejoins++;
         // synchronize self and then release peers
         ggml_backend_synchronize(be);
@@ -960,41 +989,14 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         return true;
     };
 
-    for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
-        auto tensor = cgraph->nodes[node_index];
-        auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
-
-        auto wrapped = extra->tensors[device_index];
-
-        // if (extra->needs_src_rejoin) {
-        //     printf("Tensor %s needs src rejoin\n", ggml_op_name(tensor->op));
-        // }
-
-        // wait for async memcpy to finish if needed
-        if (extra->needs_src_rejoin && pending_rejoins.size()) {
-            if (!gather_pending(node_index)) {
-                return;
-            }
-        }
-        // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        //     auto backend = ggml_parallel_backends[j];
-        //     ggml_backend_synchronize(backend);
-        // }
-
+    auto compute = [&](int node_index, ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
         backend_graph->nodes[backend_graph->n_nodes++] = ggml_backend_tp_node_compute_split(device_index, tensor);
         extra->computed[device_index] = true;
-        // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        //     auto backend = ggml_parallel_backends[j];
-        //     ggml_backend_synchronize(backend);
-        // }
-        if (extra->has_rejoin) {
-            pending_rejoins.insert(tensor);
-        }
-    }
+        return true;
+    };
 
-    if (!gather_pending(cgraph->n_nodes)) {
-        return;
-    }
+    ggml_backend_tp_buffer_walk_graph(cgraph, gather_pending, compute);
+    flush_compute(cgraph->n_nodes);
 
     thread->done.unlock();
 
