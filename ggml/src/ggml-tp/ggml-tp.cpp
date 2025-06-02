@@ -1183,9 +1183,13 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                 reduce_op->src[1] = add;
 
                 col_offset += splits.split[j];
-            }
 
+                if (!extra->reduce_op_tensors[j]->src[0] || !extra->reduce_op_tensors[j]->src[1]) {
+                    GGML_ABORT("ggml_backend_tp_buffer_init_tensor: reduce op tensor %s has no src\n", tensor->name);
+                }
+            }
         }
+
     };
 
     auto no_reduce = [&](ggml_tensor *src, ggml_tensor_parallel_extra *src_extra) {
@@ -1333,6 +1337,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             ensure_rejoined(tensor, src0);
             create_default_tensors();
             set_src_tensor(0, GGML_TP_SPLIT_NONE);
+            check_srcs();
             break;
 
         case GGML_OP_ADD:
@@ -1368,12 +1373,12 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                     set_src_tensor(1, GGML_TP_SPLIT_ROWS);
                 }
                 else if (src0_split_tensors == GGML_TP_SPLIT_REDUCE) {
-                    ensure_reduce_split_views(src1);
+                    ensure_column_split(src1);
                     create_reduce_tensors();
                     create_reduce_op_tensors();
                 }
                 else if (src1_split_tensors == GGML_TP_SPLIT_REDUCE) {
-                    ensure_reduce_split_views(src0);
+                    ensure_column_split(src0);
                     create_reduce_tensors();
                     create_reduce_op_tensors();
                 }
@@ -2457,9 +2462,9 @@ static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * te
                 reduce_op->data = wrapped->data + reduce_op->view_offs;
                 reduce_op->ne[0] = splits.split[j];
 
-                // the reduce was rejoined, and the 
                 auto reduce = reduce_extra->tensors[j];
                 if (reduce_extra->has_rejoin) {
+                    GGML_ABORT("unexpected reduce rejoin\n");
                     reduce = reduce_extra->rejoined_tensor_views[j][j];
                 }
 
@@ -2474,7 +2479,6 @@ static enum ggml_status ggml_backend_tp_buffer_late_init_tensor(ggml_tensor * te
 
                 col_offset += splits.split[j];
             }
-
         }
     }
 
