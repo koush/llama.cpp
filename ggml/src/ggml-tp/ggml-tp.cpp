@@ -892,14 +892,20 @@ static ggml_tensor* ggml_backend_tp_node_compute_split(int device_index, ggml_te
 }
 
 static bool immediate_compute = false;
-static void ggml_backend_tp_buffer_compute_graph(ggml_cgraph * cgraph, std::function<bool(int, std::set<ggml_tensor*>)> gather_pending, std::function<bool(int, ggml_tensor *, ggml_tensor_parallel_extra *)> compute) {
+static void ggml_backend_tp_buffer_compute_graph(ggml_cgraph * cgraph, std::function<bool(int, std::set<ggml_tensor*>)> gather_pending, std::function<bool(int, ggml_tensor *, ggml_tensor_parallel_extra *)> compute, std::function<void(int, std::set<ggml_tensor*>)> flush_compute) {
     std::set<ggml_tensor*> pending_gathers;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
         auto tensor = cgraph->nodes[node_index];
         auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
         // wait for async memcpy to finish if needed
-        if ((extra->needs_src_rejoin || immediate_compute) && pending_gathers.size()) {
+        if (extra->needs_src_rejoin && pending_gathers.size()) {
+            if (!immediate_compute) {
+                if (flush_compute) {
+                    flush_compute(node_index, pending_gathers);
+                }
+            }
+
             if (!gather_pending(node_index, pending_gathers)) {
                 return;
             }
@@ -912,6 +918,12 @@ static void ggml_backend_tp_buffer_compute_graph(ggml_cgraph * cgraph, std::func
 
         if (extra->has_rejoin) {
             pending_gathers.insert(tensor);
+        }
+
+        if (immediate_compute) {
+            if (flush_compute) {
+                flush_compute(node_index, pending_gathers);
+            }
         }
     }
 }
@@ -931,9 +943,13 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     auto device_index = thread->device_index;
     auto be = ggml_parallel_backends[device_index];
 
+    if (!be->iface.cpy_tensor2d_async) {
+        GGML_ABORT("Backend %s does not support async tensor copy.\n", be->iface.get_name(be));
+    }
+
     int rejoins = 0;
 
-    auto flush_compute = [&](int node_index) {
+    auto flush_compute = [&](int node_index, std::set<ggml_tensor*> pending_gathers) {
         if (backend_graph->n_nodes ) {
             auto status = be->iface.graph_compute(be, backend_graph);
             if (status != GGML_STATUS_SUCCESS) {
@@ -942,18 +958,10 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
             backend_graph->n_nodes = 0;
         }
         thread->end = node_index;
-    };
-
-    auto gather_pending = [&](int node_index, std::set<ggml_tensor*> pending_gathers) {
-        flush_compute(node_index);
 
         for (auto & tensor : pending_gathers) {
             auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
             auto wrapped = extra->tensors[device_index];
-
-            if (!be->iface.cpy_tensor2d_async) {
-                GGML_ABORT("Backend %s does not support async tensor copy.\n", be->iface.get_name(be));
-            }
 
             // async copies
             for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
@@ -974,7 +982,9 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
                 }
             }
         }
+    };
 
+    auto gather_pending = [&](int node_index, std::set<ggml_tensor*> pending_gathers) {
         rejoins++;
         // synchronize self and then release peers
         ggml_backend_synchronize(be);
@@ -999,16 +1009,11 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         backend_graph->nodes[backend_graph->n_nodes++] = ggml_backend_tp_node_compute_split(device_index, tensor);
         extra->computed[device_index] = true;
 
-        if (immediate_compute) {
-            flush_compute(node_index);
-            ggml_backend_synchronize(be);
-        }
-
         return true;
     };
 
-    ggml_backend_tp_buffer_compute_graph(cgraph, gather_pending, compute);
-    flush_compute(cgraph->n_nodes);
+    ggml_backend_tp_buffer_compute_graph(cgraph, gather_pending, compute, flush_compute);
+    flush_compute(cgraph->n_nodes, std::set<ggml_tensor*>());
 
     thread->done.unlock();
 
@@ -1061,7 +1066,7 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
             gather_buft_sizes_cur[device_index] += extra->gather_buft_sizes[device_index];
         }
         return true;
-    });
+    }, nullptr);
 
     // allocate the gather buffers
     for (size_t device_index = 0; device_index < ggml_parallel_devices.size(); device_index++) {
