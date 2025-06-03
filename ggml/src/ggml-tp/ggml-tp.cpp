@@ -970,13 +970,17 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
     auto src2_extra = src2 ? (ggml_tensor_parallel_extra *)src2->extra : nullptr;
     auto src3_extra = src3 ? (ggml_tensor_parallel_extra *)src3->extra : nullptr;
 
-    auto create_default_tensors = [&]() {
+    auto create_default_tensors_for = [](ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
         extra->split_tensors = GGML_TP_SPLIT_NONE;
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto dev = ggml_parallel_devices[j];
             auto wrapped = ggml_backend_tp_clone_tensor(tensor);
             extra->tensors[j] = wrapped;
         }
+    };
+
+    auto create_default_tensors = [&]() {
+        create_default_tensors_for(tensor, extra);
     };
 
     auto create_reduce_tensors = [&]() {
@@ -1354,9 +1358,13 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
         }
 
         case GGML_OP_RMS_NORM:
-            no_split_view(src0, src0_extra);
-            if (tensor->view_src) {
-                GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
+            // auto src0_viewsrc = src0->view_src;
+            // auto src0_viewsrc_extra = (ggml_tensor_parallel_extra *)src0_viewsrc->extra;
+            // no_split_view(src0, src0_extra);
+            if (src0->view_src) {
+                ensure_rejoined(tensor, src0->view_src);
+                create_default_tensors_for(src0, src0_extra);
+                set_src_tensor_for(src0, src0_extra, 0, GGML_TP_SPLIT_NONE);
             }
 
             ensure_rejoined(tensor, src0);
@@ -1394,7 +1402,12 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 }
                 else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS) {
                     ensure_column_split(src0);
-                    ensure_column_split(src1);
+                    if (src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+                        ensure_reduce_split_views(src1);
+                    }
+                    else {
+                        ensure_column_split(src1);
+                    }
                     create_column_split_tensors();
                     set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
                     set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
