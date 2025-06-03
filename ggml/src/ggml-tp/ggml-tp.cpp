@@ -893,6 +893,10 @@ static ggml_status reduce_gathered_tensors(ggml_cgraph * backend_graph, int devi
     auto be = ggml_parallel_backends[device_index];
     ggml_tensor * wrapped = extra->tensors[device_index];
 
+    // when reducing a tensor, the actual op (sub or add) is contained in reduce_op_tensors
+    // which needs a split view of the reduce state sources.
+    // and the final reduce (add) is contained in tensors.
+    // todo: make this part of the graph.
     for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
         if (i == 0) {
             wrapped->src[0] = extra->rejoined_tensor_views[device_index][i++];
