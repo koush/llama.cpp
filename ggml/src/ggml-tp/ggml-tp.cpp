@@ -1294,6 +1294,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
 
     bool force_rejoin = true;
     switch (tensor->op) {
+        case GGML_OP_MUL:
         case GGML_OP_MUL_MAT:
             force_rejoin = false;
             break;
@@ -1443,8 +1444,8 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             check_srcs();
             break;
 
-        case GGML_OP_ADD:
-        case GGML_OP_SUB: {
+        case GGML_OP_SUB:
+        case GGML_OP_ADD: {
             no_split_view(src0, src0_extra);
             no_split_view(src1, src1_extra);
             if (tensor->view_src) {
@@ -1454,16 +1455,17 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
             auto src1_split_tensors = src1_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src1_extra->split_tensors;
 
-            // sometimes src0/src1 may be used as input twice, one of which needs a rejoin.
-            // so check the native split state rather than the rejoin state here.
-            if (src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE && src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+            if (src0_split_tensors == GGML_TP_SPLIT_REDUCE && src0_split_tensors == GGML_TP_SPLIT_REDUCE) {
                 create_reduce_tensors();
                 create_reduce_op_tensors();
             }
             else if (!src0_split_tensors && !src1_split_tensors) {
+                ensure_rejoined(tensor, src0);
+                ensure_rejoined(tensor, src1);
                 create_default_tensors();
                 set_src_tensor(0, GGML_TP_SPLIT_NONE);
                 set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                GGML_ASSERT(ggml_are_same_shape(extra->tensors[0], extra->tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
             }
             else if ((src0_split_tensors ^ src1_split_tensors) || (src0_split_tensors == src1_split_tensors)) {
                 auto split_tensors = src0_split_tensors ? src0_split_tensors : src1_split_tensors;
@@ -1504,6 +1506,10 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                 set_src_tensor(0, GGML_TP_SPLIT_NONE);
                 set_src_tensor(1, GGML_TP_SPLIT_NONE);
             }
+
+            GGML_ASSERT(ggml_are_same_shape(extra->tensors[0], extra->tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
+            GGML_ASSERT(extra->tensors[0]->src[0]->ne[0] == extra->tensors[0]->src[0]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne0).");
+            GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[1]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
             break;
         }
 
@@ -1531,6 +1537,8 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             else {
                 GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but not as columns or rows.\n", tensor->name, ggml_op_name(tensor->op));
             }
+
+            GGML_ASSERT(ggml_are_same_shape(extra->tensors[0], extra->tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
             break;
         }
 
@@ -1550,16 +1558,22 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             if (src0_split_tensors == src1_split_tensors) {
                 // spltis match
                 if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS) {
+                    ensure_column_split(src0);
+                    ensure_column_split(src1);
                     create_column_split_tensors();
                     set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
                     set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
                 }
                 else if (src0_split_tensors == GGML_TP_SPLIT_ROWS) {
+                    ensure_row_split(src0);
+                    ensure_row_split(src1);
                     create_row_split_tensors();
                     set_src_tensor(0, GGML_TP_SPLIT_ROWS);
                     set_src_tensor(1, GGML_TP_SPLIT_ROWS);
                 }
                 else if (src0_split_tensors == GGML_TP_SPLIT_NONE) {
+                    ensure_rejoined(tensor, src0);
+                    ensure_rejoined(tensor, src1);
                     create_default_tensors();
                     set_src_tensor(0, GGML_TP_SPLIT_NONE);
                     set_src_tensor(1, GGML_TP_SPLIT_NONE);
@@ -1580,11 +1594,15 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                 // one split, one not split
                 auto split_tensors = src0_split_tensors ? src0_split_tensors : src1_split_tensors;
                 if (split_tensors == GGML_TP_SPLIT_COLUMNS) {
+                    if (src0_extra->has_rejoin || src1_extra->has_rejoin) {
+                        int i = 0;
+                    }
                     ensure_column_split(src0);
                     ensure_column_split(src1);
                     create_column_split_tensors();
                     set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
                     set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
+                    // ensure_rejoined(nullptr, tensor);
                 }
                 else if (split_tensors == GGML_TP_SPLIT_ROWS) {
                     ensure_row_split(src0);
@@ -1597,6 +1615,10 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                     GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but src1 is not.\n", tensor->name, ggml_op_name(tensor->op));
                 }
             }
+
+            GGML_ASSERT(ggml_are_same_shape(extra->tensors[0], extra->tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
+            GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[0]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
+            GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[1]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
             break;
         }
 
@@ -1648,12 +1670,25 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                 set_src_tensor(1, GGML_TP_SPLIT_NONE);
             }
             else if (src0_ctx->split && src1_split_tensors == GGML_TP_SPLIT_COLUMNS) {
-                // a weight matrix is multiplied by a column split tensor (prior to ROPE), it can be massaged to a column split.
-                // this results in a reduce split.
-                ensure_weight_column_split(src0);
-                create_reduce_tensors();
-                set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
-                set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
+                if (false ){
+                    // not possible
+                    auto src0_ctx = (ggml_backend_tp_buffer_context *)src0->buffer->context;
+                    if (!src0_ctx->split) {
+                        ensure_rejoined(tensor, src0);
+                    }
+                    ensure_rejoined(tensor, src1);
+                    create_column_split_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                    set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                }
+                else {
+                    // a weight matrix is multiplied by a column split tensor (prior to ROPE), it can be massaged to a column split.
+                    // this results in a reduce split.
+                    ensure_weight_column_split(src0);
+                    create_reduce_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+                    set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
+                }
             }
             else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src1_split_tensors == GGML_TP_SPLIT_COLUMNS) {
                 // technically supported like the weights above, but not expected.
@@ -1680,6 +1715,10 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             else {
                 GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism.\n", tensor->name, ggml_op_name(tensor->op));
             }
+
+            GGML_ASSERT(extra->tensors[0]->src[0]->ne[0] == extra->tensors[0]->src[0]->ne[0] && "Tensor parallel tensors must have the same inner dimension (ne0).");
+            GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[0]->ne[1] && "Tensor parallel has incorrect outer dimension (ne0).");
+            GGML_ASSERT(extra->tensors[0]->ne[1] == extra->tensors[0]->src[1]->ne[1] && "Tensor parallel has incorrect outer dimension (ne1).");
             break;
         }
 
