@@ -957,7 +957,7 @@ static ggml_tensor* ggml_backend_tp_node_compute_split(int device_index, ggml_te
     return reduce_op_tensor;
 }
 
-static bool immediate_compute = true;
+static bool immediate_compute = false;
 static void ggml_backend_tp_buffer_compute_graph(ggml_cgraph * cgraph, std::function<bool(int, std::set<ggml_tensor*>)> gather_pending, std::function<bool(int, ggml_tensor *, ggml_tensor_parallel_extra *)> compute, std::function<void(int, std::set<ggml_tensor*>)> flush_compute) {
     std::set<ggml_tensor*> pending_gathers;
     for (int node_index = 0; node_index < cgraph->n_nodes; node_index++) {
@@ -1360,14 +1360,14 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
         case GGML_OP_VIEW:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_RESHAPE:
-        case GGML_OP_PERMUTE:
+        // case GGML_OP_PERMUTE:
         case GGML_OP_MUL:
         case GGML_OP_MUL_MAT:
             force_rejoin = false;
             break;
     }
 
-    if (force_rejoin) {
+    if (false) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = tensor->src[i];
             if (!src) {
@@ -1473,10 +1473,17 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                     GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split as view but not evenly divisible by the rope head count.\n", tensor->name, ggml_op_name(tensor->op));
                 }
 
-                // similar to ROPE above, the input must be row split and becomes column split.
-                src0_split_tensors = GGML_TP_SPLIT_ROWS;
-                create_row_split_tensors_for(src0, src0_extra);
+                // similar to ROPE above, the input must be dim2 split and becomes row split.
+                src0_split_tensors = GGML_TP_SPLIT_DIM2;
+                create_dim2_split_tensors_for(src0, src0_extra);
                 set_src_tensor_for(src0, src0_extra, 0, GGML_TP_SPLIT_ROWS);
+                if (src0->op == GGML_OP_PERMUTE) {
+                    auto splits = get_dim_splits(src0->nb[1]);
+                    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                        auto wrapped = src0_extra->tensors[j];
+                        wrapped->nb[1] = splits.split[j];
+                    }
+                }
                 ggml_backend_tp_finish_init_tensor(src0);
             }
 
