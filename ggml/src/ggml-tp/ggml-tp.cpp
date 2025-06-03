@@ -1534,6 +1534,22 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 create_reduce_tensors();
                 create_reduce_op_tensors();
             }
+            else if (src0_split_tensors == GGML_TP_SPLIT_REDUCE && !src1_split_tensors) {
+                // src1 may be a reduce split and later gathered, so check that.
+                if (src1_extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
+                    ensure_column_split(src1);
+                }
+                create_reduce_tensors();
+                create_reduce_op_tensors();
+            }
+            else if (src1_split_tensors == GGML_TP_SPLIT_REDUCE && !src0_split_tensors) {
+                // src0 may be a reduce split and later gathered, so check that.
+                if (src0_extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
+                    ensure_column_split(src0);
+                }
+                create_reduce_tensors();
+                create_reduce_op_tensors();
+            }
             else if (!src0_split_tensors && !src1_split_tensors) {
                 ensure_rejoined(tensor, src0);
                 ensure_rejoined(tensor, src1);
