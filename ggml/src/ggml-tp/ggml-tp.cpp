@@ -1238,8 +1238,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
 
             if (split == GGML_TP_SPLIT_NONE) {
                 if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
-                    ensure_reduce_split_views(tensor->src[src_index]);
-                    wrapped->src[src_index] = src_extra->reduce_split_views[j];
+                    wrapped->src[src_index] = src_extra->tensors[j];
                 }
                 else if (src_extra->split_tensors) {
                     wrapped->src[src_index] = src_extra->converted_tensors[j];
@@ -1263,12 +1262,8 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
                 if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
                     wrapped->src[src_index] = src_extra->tensors[j];
                 }
-                else if (src_extra->split_tensors) {
-                    ensure_reduce_split_views(tensor->src[src_index]);
-                    wrapped->src[src_index] = src_extra->reduce_split_views[j];
-                }
                 else {
-                    wrapped->src[src_index] = src_extra->tensors[j];
+                    GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src%d is split as %d but requested to be split as %d.\n", tensor->name, ggml_op_name(tensor->op), src_index, src_extra->split_tensors, split);
                 }
             }
             else {
@@ -1294,6 +1289,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
 
     bool force_rejoin = true;
     switch (tensor->op) {
+        // case GGML_OP_ADD:
         case GGML_OP_MUL:
         case GGML_OP_MUL_MAT:
             force_rejoin = false;
@@ -1444,7 +1440,6 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             check_srcs();
             break;
 
-        case GGML_OP_SUB:
         case GGML_OP_ADD: {
             no_split_view(src0, src0_extra);
             no_split_view(src1, src1_extra);
@@ -1542,6 +1537,7 @@ static void do_init(ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
             break;
         }
 
+        case GGML_OP_SUB:
         case GGML_OP_DIV:
         case GGML_OP_MUL: {
             no_split_view(src0, src0_extra);
