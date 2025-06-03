@@ -696,6 +696,7 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
     // if (reason && reason != src) {
     //     printf("Rejoining tensor for %s %s\n", ggml_op_name(reason->op), ggml_op_name(src->op));
     // }
+    // printf("rejoining tensor %s for %s %s\n", src->name, reason ? ggml_op_name(reason->op) : "none", ggml_op_name(src->op));
 
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(src->buffer->buft);
 
