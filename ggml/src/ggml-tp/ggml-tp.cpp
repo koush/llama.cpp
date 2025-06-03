@@ -1696,7 +1696,105 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 set_src_tensor(1, GGML_TP_SPLIT_NONE);
             }
             else {
-                GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split.\n", tensor->name, ggml_op_name(tensor->op));
+                // GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split.\n", tensor->name, ggml_op_name(tensor->op));
+
+                if (src0_extra->split_tensors == GGML_TP_SPLIT_VIEW) {
+                    auto view_src = src0;
+                    while (view_src->view_src) {
+                        view_src = view_src->view_src;
+                    }
+                    auto view_src_extra = (ggml_tensor_parallel_extra *)view_src->extra;
+                    if (tensor->ne[0] == view_src->ne[0]) {
+                        if (view_src_extra->split_tensors == GGML_TP_SPLIT_COLUMNS) {
+                            create_column_split_tensors_for(src0, src0_extra);
+                            ggml_backend_tp_finish_init_tensor(src0);
+                        }
+                        else if (view_src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
+                            create_row_split_tensors_for(src0, src0_extra);
+                            ggml_backend_tp_finish_init_tensor(src0);
+                        }
+                        else {
+                            GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split as %d but requested to be split as %d.\n", tensor->name, ggml_op_name(tensor->op), src0_extra->split_tensors, GGML_TP_SPLIT_NONE);
+                        }
+                    }
+                    else if (tensor->ne[0] > view_src->ne[0]) {
+                        create_column_split_tensors_for(src0, src0_extra);
+                        ggml_backend_tp_finish_init_tensor(src0);
+                    }
+                    else {
+                        create_row_split_tensors_for(src0, src0_extra);
+                        ggml_backend_tp_finish_init_tensor(src0);
+                    }
+                }
+
+                // create_column_split_tensors_for(src0, src0_extra);
+                // ggml_backend_tp_finish_init_tensor(src0);
+                ensure_rejoined(tensor, src0);
+
+                create_default_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_NONE);
+                set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                
+
+
+                // auto view_src = src0;
+                // while (view_src->view_src) {
+                //     view_src = view_src->view_src;
+                //     ensure_rejoined(tensor, view_src);
+                // }
+                // auto view_src_extra = (ggml_tensor_parallel_extra *)view_src->extra;
+
+                // if (src0_extra->split_tensors == GGML_TP_SPLIT_VIEW) {
+                //     if (src0->ne[0] == view_src->ne[0]) {
+                //         if (view_src_extra->split_tensors == GGML_TP_SPLIT_COLUMNS) {
+                //             create_column_split_tensors_for(src0, src0_extra);
+                //             // set_src_tensor_for(src0, src0_extra, 0, GGML_TP_SPLIT_COLUMNS);
+                //             ggml_backend_tp_finish_init_tensor(src0);
+                //         }
+                //         else if (view_src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
+                //             create_row_split_tensors_for(src0, src0_extra);
+                //             // set_src_tensor_for(src0, src0_extra, 0, GGML_TP_SPLIT_ROWS);
+                //             ggml_backend_tp_finish_init_tensor(src0);
+                //         }
+                //         else {
+                //             GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split as %d but requested to be split as %d.\n", tensor->name, ggml_op_name(tensor->op), view_src_extra->split_tensors, GGML_TP_SPLIT_NONE);
+                //         }
+                //     }
+                //     else 
+                //     if (src0->ne[0] > view_src->ne[0]) {
+                //         create_column_split_tensors_for(src0, src0_extra);
+                //         // set_src_tensor_for(src0, src0_extra, 0, GGML_TP_SPLIT_COLUMNS);
+                //         ggml_backend_tp_finish_init_tensor(src0);
+                //     }
+                //     else {
+                //             create_row_split_tensors_for(src0, src0_extra);
+                //         // set_src_tensor_for(src0, src0_extra, 0, GGML_TP_SPLIT_ROWS);
+                //         ggml_backend_tp_finish_init_tensor(src0);
+                //     }
+                // }
+
+
+                // if (tensor->ne[0] == view_src->ne[0]) {
+                //     if (view_src_extra->split_tensors == GGML_TP_SPLIT_COLUMNS) {
+                //         create_column_split_tensors();
+                //         set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+                //     }
+                //     else if (view_src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
+                //         create_row_split_tensors();
+                //         set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                //     }
+                //     else {
+                //         GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split as %d but requested to be split as %d.\n", tensor->name, ggml_op_name(tensor->op), view_src_extra->split_tensors, GGML_TP_SPLIT_NONE);
+                //     }
+                // }
+                // else if (tensor->ne[0] > view_src->ne[0]) {
+                //     create_column_split_tensors();
+                //     set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+                // }
+                // else {
+                //     create_row_split_tensors();
+                //     set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                // }
             }
             break;
         }
@@ -2524,7 +2622,7 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
         return true;
     }
 
-    return src0->ne[1] >= 2048;
+    return src0->ne[1] >= 1024;
     return src0->ne[1] >= 8192;
 }
 
