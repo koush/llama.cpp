@@ -771,6 +771,7 @@ static ggml_status reduce_gathered_tensors(ggml_cgraph * backend_graph, int devi
             backend_graph->nodes[backend_graph->n_nodes++] = wrapped;
             continue;
         }
+        GGML_ABORT("TP: reduce gather tensor %s for device %d, but it has more than 2 sources.\n", tensor->name, device_index);
         wrapped->src[0] = wrapped;
         wrapped->src[1] = extra->rejoined_tensor_views[device_index][i];
         backend_graph->nodes[backend_graph->n_nodes++] = wrapped;
@@ -1746,8 +1747,11 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
 }
 
 static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    auto lastStartTime = std::chrono::high_resolution_clock::now();
-
+    // static auto startTime = std::chrono::high_resolution_clock::now();
+    // auto since_last = std::chrono::high_resolution_clock::now() - startTime;
+    // startTime = std::chrono::high_resolution_clock::now();
+    // printf("since last TP graph compute: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(since_last).count());
+    
     std::set<ggml_tensor*> tensors;
 
     ggml_backend_tp_buffer_compute_graph(cgraph, nullptr, [&](int node_index, ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
@@ -1835,8 +1839,14 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         }
     }
 
-    // printf("TP graph compute time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - lastStartTime).count());
-    lastStartTime = std::chrono::high_resolution_clock::now();
+
+    // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+    //     auto be = ggml_parallel_backends[j];
+    //     ggml_backend_synchronize(be);
+    // }
+
+    // auto endTime = std::chrono::high_resolution_clock::now();
+    // printf("TP graph compute took %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count());
 
     return failed ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
 
