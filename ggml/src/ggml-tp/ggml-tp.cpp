@@ -1607,8 +1607,8 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             break;
         }
 
-        case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID: {
+        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT: {
             no_split_view(src0, src0_extra);
             if (tensor->view_src) {
                 GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
@@ -1704,7 +1704,16 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
 
             GGML_ASSERT(extra->tensors[0]->src[0]->ne[0] == extra->tensors[0]->src[0]->ne[0] && "Tensor parallel tensors must have the same inner dimension (ne0).");
             GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[0]->ne[1] && "Tensor parallel has incorrect outer dimension (ne0).");
-            GGML_ASSERT(extra->tensors[0]->ne[1] == extra->tensors[0]->src[1]->ne[1] && "Tensor parallel has incorrect outer dimension (ne1).");
+
+            if (tensor->op == GGML_OP_MUL_MAT_ID) {
+                // all experts are split so all GPUs will run a portion of each expert.
+                set_src_tensor(2, GGML_TP_SPLIT_NONE);
+
+                GGML_ASSERT(extra->tensors[0]->ne[2] == extra->tensors[0]->src[1]->ne[2] && "Tensor parallel has incorrect outer dimension (ne1).");
+            }
+            else {
+                GGML_ASSERT(extra->tensors[0]->ne[1] == extra->tensors[0]->src[1]->ne[1] && "Tensor parallel has incorrect outer dimension (ne1).");
+            }
             break;
         }
 
