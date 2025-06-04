@@ -962,6 +962,18 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
 
     extra->initialized = true;
 
+    // ensure all src are initialized, out of order usage is possible on view tensors.
+    for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+        auto src = tensor->src[i];
+        if (!src) {
+            break;
+        }
+        auto src_extra = (ggml_tensor_parallel_extra *)src->extra;
+        // node index is incorrect here, but need something for debugging.
+        do_init(node_index, src, src_extra);
+    }
+
+
     auto src0 = tensor->src[0];
     auto src1 = tensor->src[1];
     auto src2 = tensor->src[2];
@@ -1608,7 +1620,6 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
 
             GGML_ASSERT(ggml_are_same_shape(extra->tensors[0], extra->tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
             GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[0]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
-            GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[1]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
             break;
         }
 
@@ -1725,7 +1736,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             create_default_tensors();
             set_src_tensor(0, GGML_TP_SPLIT_NONE);
             set_src_tensor(1, GGML_TP_SPLIT_NONE);
-
+            check_srcs();
             break;
         }
 
@@ -1758,6 +1769,31 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but not as columns or rows.\n", tensor->name, ggml_op_name(tensor->op));
             }
             set_src_tensor(1, GGML_TP_SPLIT_NONE);
+            check_srcs();
+            break;
+        }
+
+        case GGML_OP_SUM_ROWS: {
+            no_split_view(src0, src0_extra);
+            if (extra->split_tensors == GGML_TP_SPLIT_COLUMNS) {
+                create_column_split_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+            }
+            else {
+                ensure_rejoined(tensor, src0);
+                create_default_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_NONE);
+            }
+            check_srcs();
+            break;
+        }
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ARGSORT: {
+            no_split_view(src0, src0_extra);
+
+            ensure_rejoined(tensor, src0);
+            create_default_tensors();
+            set_src_tensor(0, GGML_TP_SPLIT_NONE);
             check_srcs();
             break;
         }
@@ -2512,6 +2548,10 @@ static ggml_backend_buffer_type_t ggml_backend_tp_device_get_buffer_type(ggml_ba
 static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     GGML_UNUSED(op);
+
+    if (op->op == GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
 
     auto buft = op->buffer ? op->buffer->buft : nullptr;
     if (buft && (!ggml_backend_buft_is_tp_split(buft) && !ggml_backend_buft_is_tp(buft))) {
