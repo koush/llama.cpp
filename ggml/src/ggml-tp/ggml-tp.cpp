@@ -1244,7 +1244,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
         ggml_backend_tp_finish_init_tensor(tensor);
     };
 
-    bool force_rejoin = true;
+    bool force_rejoin = false;
     if (force_rejoin) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto src = tensor->src[i];
@@ -1710,9 +1710,10 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
 
         case GGML_OP_CPY: {
             // the src1 is the destination, and has already been created.
-            // it maybe op NONE or op VIEW. without graph introspection.
+            // it maybe op NONE or op VIEW. without graph inspection.
             // it is possible to use this cpy op to make the src1 tensor tree
             // split, but this is simpler for now.
+            // the min split amount in supports_opt also affects this.
             ensure_init_from_viewsrc(src0, src0_extra);
             ensure_init_from_viewsrc(src1, src1_extra);
             ensure_rejoined(tensor, src0);
@@ -2575,7 +2576,9 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
         return true;
     }
 
-    return src0->ne[1] >= 1024;
+    // using something too small reduces performance due to additional rejoins.
+    // return src0->ne[1] >= 2048;
+    return src0->ne[1] >= 4096;
     return src0->ne[1] >= 8192;
 }
 
