@@ -234,7 +234,7 @@ static size_t ggml_align_size(size_t size, size_t alignment) {
     return (size + alignment - 1) & ~(alignment - 1);
 }
 
-static ggml_tensor* ggml_backend_tp_clone_tensor(const ggml_tensor * tensor) {
+static ggml_tensor* ggml_backend_tp_clone_tensor(const ggml_tensor * tensor, bool offset_aware = false) {
     ggml_tensor * wrapped = new ggml_tensor();
     ggml_set_name(wrapped, tensor->name);
     wrapped->type = (ggml_type) tensor->type;
@@ -252,6 +252,14 @@ static ggml_tensor* ggml_backend_tp_clone_tensor(const ggml_tensor * tensor) {
     for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
         wrapped->op_params[i] = tensor->op_params[i];
     }
+
+    if (tensor->view_offs) {
+        if (!offset_aware)  {
+            GGML_ABORT("Tensor %s is a view, cannot clone it.\n", tensor->name);
+        }
+        wrapped->view_offs = tensor->view_offs;
+    }
+
     return wrapped;
 }
 
@@ -305,6 +313,11 @@ static ggml_status ensure_dim2_split(const ggml_tensor *src) {
     // no actual conversion needs to take place, the split tensors can be
     // created by using offsets within the original tensor.
     auto splits = get_dim_splits(src->ne[2]);
+
+    if (splits.split[0] != splits.split[1]) {
+        GGML_ABORT("Tensor %s is not evenly split across devices, dim2 split requires equal splits.\n", src->name);
+    }
+
     size_t offset = 0;
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto split = ggml_backend_tp_clone_tensor(src);
@@ -339,6 +352,10 @@ static ggml_status ensure_row_split(const ggml_tensor *src) {
     // no actual conversion needs to take place, the split tensors can be
     // created by using offsets within the original tensor.
     auto splits = get_row_splits(src);
+    if (splits.split[0] != splits.split[1]) {
+        GGML_ABORT("Tensor %s is not evenly split across devices, row split requires equal splits.\n", src->name);
+    }
+
     size_t offset = 0;
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto split = ggml_backend_tp_clone_tensor(src);
@@ -376,6 +393,9 @@ static ggml_status ensure_column_split(const ggml_tensor *src) {
     // unlike the matmult weight tensors which are rejoined column wise, when
     // splitting tensors for unary or arithmetic operations, split them row wise.
     auto splits = get_col_splits(src);
+    if (splits.split[0] != splits.split[1]) {
+        GGML_ABORT("Tensor %s is not evenly split across devices, column split requires equal splits.\n", src->name);
+    }
 
     size_t offset = 0;
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -588,6 +608,9 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
     }
     else if (src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
         auto splits = get_row_splits(src);
+        if (splits.split[0] != splits.split[1]) {
+            GGML_ABORT("Tensor %s is not evenly split across devices, row rejoin requires equal splits.\n", src->name);
+        }
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto rejoined = src_extra->converted_tensors[j];
 
@@ -617,6 +640,9 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
         // A A B B C C D D
         // A A B B C C D D
         auto splits = get_col_splits(src);
+        if (splits.split[0] != splits.split[1]) {
+            GGML_ABORT("Tensor %s is not evenly split across devices, column rejoin requires equal splits.\n", src->name);
+        }
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto rejoined = src_extra->converted_tensors[j];
 
@@ -982,7 +1008,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
     auto create_default_tensors_for = [](ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
         extra->split_tensors = GGML_TP_SPLIT_NONE;
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-            auto wrapped = ggml_backend_tp_clone_tensor(tensor);
+            auto wrapped = ggml_backend_tp_clone_tensor(tensor, true);
             extra->tensors[j] = wrapped;
         }
     };
@@ -999,8 +1025,8 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
         }
     };
 
-    auto prepare_wrapped = [](ggml_tensor * tensor, ggml_tensor * dims) {
-        auto wrapped = ggml_backend_tp_clone_tensor(dims);
+    auto prepare_wrapped = [](ggml_tensor * tensor, ggml_tensor * dims, bool offset_aware = false) {
+        auto wrapped = ggml_backend_tp_clone_tensor(dims, offset_aware);
         if (dims != tensor) {
             wrapped->op = tensor->op;
             for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
@@ -1030,12 +1056,12 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
         create_row_split_tensors_for(tensor, extra);
     };
 
-    auto create_column_split_tensors_for = [prepare_wrapped](ggml_tensor * tensor, ggml_tensor_parallel_extra * extra, ggml_tensor * dims = nullptr) {
+    auto create_column_split_tensors_for = [prepare_wrapped](ggml_tensor * tensor, ggml_tensor_parallel_extra * extra, ggml_tensor * dims = nullptr, bool offset_aware = false) {
         dims = dims ? dims : tensor;
         extra->split_tensors = GGML_TP_SPLIT_COLUMNS;
         auto splits = get_col_splits(dims);
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-            auto wrapped = prepare_wrapped(tensor, dims);
+            auto wrapped = prepare_wrapped(tensor, dims, offset_aware);
             extra->tensors[j] = wrapped;
 
             // update col count
@@ -1047,8 +1073,8 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
         }
     };
 
-    auto create_column_split_tensors = [&]() {
-        create_column_split_tensors_for(tensor, extra);
+    auto create_column_split_tensors = [&](bool offset_aware = false) {
+        create_column_split_tensors_for(tensor, extra, nullptr, offset_aware);
     };
 
     auto create_dim2_split_tensors_for = [prepare_wrapped](ggml_tensor * tensor, ggml_tensor_parallel_extra * extra, ggml_tensor * dims = nullptr) {
@@ -1577,19 +1603,44 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 // one split, one not split
                 auto split_tensors = src0_split_tensors ? src0_split_tensors : src1_split_tensors;
                 if (split_tensors == GGML_TP_SPLIT_COLUMNS) {
-                    ensure_column_split(src0);
-                    ensure_column_split(src1);
                     create_column_split_tensors();
-                    set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
-                    set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
-                    // ensure_rejoined(nullptr, tensor);
+                    // this may be a broadcast tensor.
+                    if (src0->ne[0] != 1) {
+                        ensure_column_split(src0);
+                        set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+                    }
+                    else {
+                        ensure_rejoined(tensor, src0);
+                        set_src_tensor(0, GGML_TP_SPLIT_NONE);
+                    }
+                    if (src1->ne[0] != 1) {
+                        ensure_column_split(src1);
+                        set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
+                    }
+                    else {
+                        ensure_rejoined(tensor, src1);
+                        set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                    }
                 }
                 else if (split_tensors == GGML_TP_SPLIT_ROWS) {
-                    ensure_row_split(src0);
-                    ensure_row_split(src1);
                     create_row_split_tensors();
-                    set_src_tensor(0, GGML_TP_SPLIT_ROWS);
-                    set_src_tensor(1, GGML_TP_SPLIT_ROWS);
+                    // this may be a broadcast tensor.
+                    if (src0->ne[0] != 1) {
+                        ensure_row_split(src0);
+                        set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                    }
+                    else {
+                        ensure_rejoined(tensor, src0);
+                        set_src_tensor(0, GGML_TP_SPLIT_NONE);
+                    }
+                    if (src1->ne[0] != 1) {
+                        ensure_row_split(src1);
+                        set_src_tensor(1, GGML_TP_SPLIT_ROWS);
+                    }
+                    else {
+                        ensure_rejoined(tensor, src1);
+                        set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                    }
                 }
                 else {
                     GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split but src1 is not.\n", tensor->name, ggml_op_name(tensor->op));
@@ -1664,10 +1715,11 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 else {
                     // a weight matrix is multiplied by a column split tensor (prior to ROPE), it can be massaged to a column split.
                     // this results in a reduce split.
-                    ensure_weight_column_split(src0);
-                    create_reduce_tensors();
-                    set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
-                    set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
+                    ensure_row_split(src0);
+                    ensure_rejoined(tensor, src1);
+                    create_column_split_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                    set_src_tensor(1, GGML_TP_SPLIT_NONE);
                 }
             }
             else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src1_split_tensors == GGML_TP_SPLIT_COLUMNS) {
@@ -1697,15 +1749,16 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             }
 
             GGML_ASSERT(extra->tensors[0]->src[0]->ne[0] == extra->tensors[0]->src[0]->ne[0] && "Tensor parallel tensors must have the same inner dimension (ne0).");
-            GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[0]->ne[1] && "Tensor parallel has incorrect outer dimension (ne0).");
 
             if (tensor->op == GGML_OP_MUL_MAT_ID) {
                 // all experts are split so all GPUs will run a portion of each expert.
                 set_src_tensor(2, GGML_TP_SPLIT_NONE);
 
+                GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[0]->ne[1] && "Tensor parallel has incorrect outer dimension (ne0).");
                 GGML_ASSERT(extra->tensors[0]->ne[2] == extra->tensors[0]->src[1]->ne[2] && "Tensor parallel has incorrect outer dimension (ne1).");
             }
             else {
+                GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[0]->ne[1] && "Tensor parallel has incorrect outer dimension (ne0).");
                 GGML_ASSERT(extra->tensors[0]->ne[1] == extra->tensors[0]->src[1]->ne[1] && "Tensor parallel has incorrect outer dimension (ne1).");
             }
             break;
@@ -1794,9 +1847,9 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             }
             else {
                 if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src0->ne[0] == tensor->ne[0]) {
-                    GGML_LOG_WARN("UNUSED CODE PATH VIEW SPLIT COL\n");
+                    // GGML_LOG_WARN("UNUSED CODE PATH VIEW SPLIT COL\n");
                     // column split tensor with no change to columns
-                    create_column_split_tensors();
+                    create_column_split_tensors(true);
                     set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
                 }
                 else if (src0_split_tensors == GGML_TP_SPLIT_ROWS && src0->ne[1] == tensor->ne[1]) {
@@ -2265,6 +2318,9 @@ static void ensure_weight_column_split(ggml_tensor * weight) {
     auto blocks_per_row = weight->ne[0] / block_size;
     auto elements_per_block = weight->ne[0] / blocks_per_row;
     auto splits = get_dim_splits(blocks_per_row);
+    if (splits.split[0] != splits.split[1]) {
+        GGML_ABORT("Tensor %s has uneven splits for columns, expected equal splits for all devices.\n", weight->name);
+    }
 
     offset = 0;
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -2606,7 +2662,14 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
 
     // using something too small reduces performance due to additional rejoins.
     // return src0->ne[1] >= 2048;
-    return src0->ne[1] >= 4096;
+    if (src0->ne[1] >= 4096)
+        return true;
+    if (src0->ne[1] * src0->ne[2] >= 4096) {
+        if (src0->ne[1] >= 2048)
+            return true;
+        return false;
+    }
+    return false;
     return src0->ne[1] >= 8192;
 }
 
