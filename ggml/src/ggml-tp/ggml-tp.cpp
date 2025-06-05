@@ -563,11 +563,6 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
         rejoined->op = GGML_OP_NONE;
     }
 
-    auto view_src = src;
-    while (view_src->view_src) {
-        view_src = view_src->view_src;
-    }
-
     if (src_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto dev = ggml_parallel_devices[j];
@@ -579,7 +574,7 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
 
             size_t reduce_offset = 0;
             for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
-                auto view = ggml_backend_tp_clone_tensor(view_src);
+                auto view = ggml_backend_tp_clone_tensor(src);
                 src_extra->rejoined_tensor_views[j][i] = view;
 
                 view->op = GGML_OP_NONE;
@@ -592,26 +587,26 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
         }
     }
     else if (src_extra->split_tensors == GGML_TP_SPLIT_ROWS) {
-        auto splits = get_row_splits(view_src);
+        auto splits = get_row_splits(src);
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto rejoined = src_extra->converted_tensors[j];
 
             size_t row_offset = 0;
             for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
-                auto view = ggml_backend_tp_clone_tensor(view_src);
+                auto view = ggml_backend_tp_clone_tensor(src);
                 src_extra->rejoined_tensor_views[j][i] = view;
 
                 view->op = GGML_OP_NONE;
                 view->view_src = rejoined;
                 view->ne[1] = splits.split[i];
                 // adjust the offset to the start of the row in the destination tensor
-                view->view_offs = view_src->nb[1] * row_offset;
+                view->view_offs = src->nb[1] * row_offset;
 
                 row_offset += splits.split[j];
             }
         }
     }
-    else {
+    else if (src_extra->split_tensors == GGML_TP_SPLIT_COLUMNS) {
         // a typical tensor that is split across multiple devices is usually column split.
         // this is because the weight matrixes are transposed and row split, resulting in
         // column split resilt. this can not be concatenated memorywise (rowwise).
@@ -621,24 +616,27 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
         // A A B B C C D D
         // A A B B C C D D
         // A A B B C C D D
-        auto splits = get_col_splits(view_src);
+        auto splits = get_col_splits(src);
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto rejoined = src_extra->converted_tensors[j];
 
             size_t col_offset = 0;
             for (size_t i = 0; i < ggml_parallel_devices.size(); i++) {
-                auto view = ggml_backend_tp_clone_tensor(view_src);
+                auto view = ggml_backend_tp_clone_tensor(src);
                 src_extra->rejoined_tensor_views[j][i] = view;
 
                 view->op = GGML_OP_NONE;
                 view->view_src = rejoined;
                 view->ne[0] = splits.split[i];
                 // adjust the offset to the start of the column in the destination tensor
-                view->view_offs = view_src->nb[1] / view_src->ne[0] * col_offset;
+                view->view_offs = src->nb[1] / src->ne[0] * col_offset;
 
                 col_offset += splits.split[j];
             }
         }
+    }
+    else {
+        GGML_ABORT("Tensor %s is split as %d, but rejoin requested.\n", src->name, src_extra->split_tensors);
     }
 }
 
@@ -1139,7 +1137,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
     };
 
     auto no_split_view = [](ggml_tensor *src, ggml_tensor_parallel_extra *src_extra) {
-        if (src_extra->split_tensors && src->view_src) {
+        if (src_extra->split_tensors == GGML_TP_SPLIT_VIEW) {
             GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", src->name);
         }
     };
