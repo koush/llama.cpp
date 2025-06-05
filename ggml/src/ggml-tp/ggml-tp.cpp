@@ -1263,10 +1263,6 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
 
     switch (tensor->op) {
         case GGML_OP_ROPE: {
-            if (tensor->view_src) {
-                GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
-            }
-
             auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
 
             if (src0_extra->split_tensors == GGML_TP_SPLIT_VIEW) {
@@ -1790,7 +1786,32 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             break;
         }
 
-        case GGML_OP_VIEW:
+        case GGML_OP_VIEW: {
+            auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
+            if (!src0_split_tensors) {
+                create_default_tensors();
+                set_src_tensor(0, GGML_TP_SPLIT_NONE);
+            }
+            else {
+                if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src0->ne[0] == tensor->ne[0]) {
+                    GGML_LOG_WARN("UNUSED CODE PATH VIEW SPLIT COL\n");
+                    // column split tensor with no change to columns
+                    create_column_split_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+                }
+                else if (src0_split_tensors == GGML_TP_SPLIT_ROWS && src0->ne[1] == tensor->ne[1]) {
+                    GGML_LOG_WARN("UNUSED CODE PATH VIEW SPLIT ROW\n");
+                    // row split tensor with no change to rows
+                    create_row_split_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                }
+                else {
+                    has_init = true;
+                    extra->split_tensors = GGML_TP_SPLIT_VIEW;
+                }
+            }
+            break;
+        }
         case GGML_OP_PERMUTE:
         case GGML_OP_RESHAPE: {
             auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
