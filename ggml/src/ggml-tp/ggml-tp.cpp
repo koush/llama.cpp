@@ -910,6 +910,11 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
         thread->end = node_index;
 
         for (auto & tensor : pending_gathers) {
+            // why does this happen?
+            if (tensor->ne[1] == 0) {
+                continue;
+            }
+
             auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
             auto wrapped = extra->tensors[device_index];
 
