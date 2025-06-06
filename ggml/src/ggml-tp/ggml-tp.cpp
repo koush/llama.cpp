@@ -1065,6 +1065,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
         dims = dims ? dims : tensor;
         extra->split_tensors = GGML_TP_SPLIT_COLUMNS;
         auto splits = get_col_splits(dims);
+        auto offset_splits = get_dim_splits(tensor->view_offs);
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
             auto wrapped = prepare_wrapped(tensor, dims, offset_aware);
             extra->tensors[j] = wrapped;
@@ -1075,6 +1076,10 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             wrapped->nb[1] = wrapped->nb[1] / dims->ne[0] * splits.split[j];
             wrapped->nb[2] = wrapped->nb[2] / dims->ne[0] * splits.split[j];
             wrapped->nb[3] = wrapped->nb[3] / dims->ne[0] * splits.split[j];
+
+            if (offset_aware) {
+                wrapped->view_offs = offset_splits.split[j];
+            }
         }
     };
 
@@ -1720,11 +1725,10 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 else {
                     // a weight matrix is multiplied by a column split tensor (prior to ROPE), it can be massaged to a column split.
                     // this results in a reduce split.
-                    ensure_row_split(src0);
-                    ensure_rejoined(tensor, src1);
-                    create_column_split_tensors();
-                    set_src_tensor(0, GGML_TP_SPLIT_ROWS);
-                    set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                    ensure_weight_column_split(src0);
+                    create_reduce_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+                    set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
                 }
             }
             else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src1_split_tensors == GGML_TP_SPLIT_COLUMNS) {
@@ -2670,7 +2674,7 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
     if (src0->ne[1] >= 4096)
         return true;
     if (src0->ne[1] * src0->ne[2] >= 4096) {
-        if (src0->ne[1] >= 2048)
+        if (src0->ne[1] >= 1024)
             return true;
         return false;
     }
