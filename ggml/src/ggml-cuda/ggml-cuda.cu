@@ -2437,11 +2437,16 @@ static ggml_2d_cpy ggml_backend_cuda_2d_pitch(const ggml_tensor *tensor) {
 
             next_nb = tensor->nb[i];
         }
+        else if (pitch) {
+            // when collapsing a 2d tensor, muliply height by the number of elements in the dimension
+            height *= tensor->ne[i];
+        }
 
         next_nb *= tensor->ne[i];
     }
     // 1d contiguous
     if (!pitch) {
+        // a 1d tensor can simply be the total number of bytes.
         return { tensor->nb[3], 1, tensor->nb[3] };
     }
     return { width, height, pitch };
@@ -2516,7 +2521,7 @@ static bool ggml_backend_cuda_cpy_tensor2d_async_common(ggml_backend_t backend_s
         // attempt a 1d copy if possible
         bool src_is_1d = src_pitch.width == src_pitch.pitch;
         bool dst_is_1d = dst_pitch.width == dst_pitch.pitch;
-        bool is_1d = src_is_1d && dst_is_1d;
+        is_1d = src_is_1d && dst_is_1d;
 
         if (!is_1d) {
             // in case one is 1d and the other is not, collapse the dimensions to match
