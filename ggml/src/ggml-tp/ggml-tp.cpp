@@ -911,7 +911,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
         for (auto & tensor : pending_gathers) {
             // why does this happen?
-            if (tensor->ne[1] == 0) {
+            if (tensor->ne[0] == 0 || tensor->ne[1] == 0 || tensor->ne[2] == 0 || tensor->ne[3] == 0) {
                 continue;
             }
 
@@ -1723,12 +1723,19 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                     set_src_tensor(1, GGML_TP_SPLIT_NONE);
                 }
                 else {
+                    // TODO: this path is disabled because column splitting quantized weights in MoE models often results in busted splits.
+
                     // a weight matrix is multiplied by a column split tensor (prior to ROPE), it can be massaged to a column split.
                     // this results in a reduce split.
-                    ensure_weight_column_split(src0);
-                    create_reduce_tensors();
-                    set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
-                    set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
+                    // ensure_weight_column_split(src0);
+                    // create_reduce_tensors();
+                    // set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+                    // set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
+
+                    ensure_rejoined(tensor, src1);
+                    create_column_split_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                    set_src_tensor(1, GGML_TP_SPLIT_NONE);
                 }
             }
             else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src1_split_tensors == GGML_TP_SPLIT_COLUMNS) {
@@ -1855,7 +1862,13 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 set_src_tensor(0, GGML_TP_SPLIT_NONE);
             }
             else {
-                if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src0->ne[0] == tensor->ne[0]) {
+                // i'm not sure why the following code does not work, will need to investigate.
+                if (true) {
+                    ensure_rejoined(tensor, src0);
+                    create_default_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_NONE);
+                }
+                else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src0->ne[0] == tensor->ne[0]) {
                     // GGML_LOG_WARN("UNUSED CODE PATH VIEW SPLIT COL\n");
                     // column split tensor with no change to columns
                     create_column_split_tensors(true);
@@ -2037,29 +2050,39 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
 
     // weight matrices used for mul mat are transposed, so split on row
     ggml_split splits = get_row_splits(tensor);
-    size_t cur_row = 0;
-    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        auto wrapped = extra->tensors[j];
-        auto be = ggml_parallel_backends[j];
+    for (int n_expert = 0; n_expert < tensor->ne[2]; n_expert++) {
+        size_t data_expert_offset = n_expert * tensor->nb[2];
+        // weight matrix in moe models will have multiple sequences ne[2] per expert
+        size_t cur_row = 0;
+        for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+            auto wrapped = extra->tensors[j];
+            auto be = ggml_parallel_backends[j];
 
-        // the split tensors should have the same alignment as the wrapping tensor, and thus the same stride.
-        if (wrapped->nb[1] != tensor->nb[1]) {
-            GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: wrapped->nb[1] %zu != tensor->nb[1] %zu\n", wrapped->nb[1], tensor->nb[1]);
-            return;
-        }
+            // the split tensors should have the same alignment as the wrapping tensor, and thus the same stride.
+            if (wrapped->nb[1] != tensor->nb[1]) {
+                GGML_LOG_ERROR("ggml_backend_tp_buffer_set_tensor: wrapped->nb[1] %zu != tensor->nb[1] %zu\n", wrapped->nb[1], tensor->nb[1]);
+                return;
+            }
 
-        auto split_offset = cur_row * tensor->nb[1];
-        auto split_size = (size_t) splits.split[j] * tensor->nb[1];
-        
-        if (be->iface.set_tensor_async) {
-            be->iface.set_tensor_async(be, wrapped, (const char *) data + split_offset, 0, split_size);
-        }
-        else {
-            auto backend_buffer = ctx->backend_buffers[j];
-            backend_buffer->iface.set_tensor(backend_buffer, wrapped, (const char *) data + split_offset, 0, split_size);
-        }
+            auto data_row_offset = cur_row * tensor->nb[1];
+            auto split_size = (size_t) splits.split[j] * tensor->nb[1];
+            auto split_expert_offset = n_expert * split_size;
+            
+            GGML_ASSERT(split_expert_offset == n_expert * wrapped->nb[2]);
+            GGML_ASSERT(wrapped->nb[2] == split_size);
+            GGML_ASSERT(wrapped->ne[1] == splits.split[j]);  // confirm split row count
+            GGML_ASSERT(wrapped->ne[2] == tensor->ne[2]);    // unless you're splitting experts too
 
-        cur_row += splits.split[j];
+            if (be->iface.set_tensor_async) {
+                be->iface.set_tensor_async(be, wrapped, (const char *) data + data_expert_offset + data_row_offset, split_expert_offset, split_size);
+            }
+            else {
+                auto backend_buffer = ctx->backend_buffers[j];
+                backend_buffer->iface.set_tensor(backend_buffer, wrapped, (const char *) data + data_row_offset, split_expert_offset, split_size);
+            }
+
+            cur_row += splits.split[j];
+        }
     }
 }
 
@@ -2420,7 +2443,7 @@ static enum ggml_status ggml_backend_tp_finish_init_tensor(ggml_tensor *tensor) 
             auto view_src = view_src_extra->tensors[j];
             auto rem = tensor->view_offs % alignment;
             auto view_offs = tensor->view_offs / alignment * device_alignment + rem;
-            wrapped->data = (char *) view_src->data + view_offs;
+            wrapped->data = (char *) view_src->data + wrapped->view_offs;
             wrapped->view_src = view_src;
             wrapped->view_offs = view_offs;
             if (wrapped->view_src == NULL) {
@@ -2490,6 +2513,13 @@ static enum ggml_status ggml_backend_tp_buffer_init_tensor(ggml_backend_buffer_t
 
 static void ggml_backend_tp_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_set_tensor_async_common(buffer, tensor, data, offset, size);
+
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto be = ggml_parallel_backends[j];
+        if (be->iface.set_tensor_async) {
+            ggml_backend_synchronize(be);
+        }
+    }
 }
 
 static void ggml_backend_tp_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2673,10 +2703,9 @@ static bool ggml_backend_tp_device_supports_op(ggml_backend_dev_t dev, const str
     // return src0->ne[1] >= 2048;
     if (src0->ne[1] >= 4096)
         return true;
+    // moe
     if (src0->ne[1] * src0->ne[2] >= 4096) {
-        if (src0->ne[1] >= 1024)
-            return true;
-        return false;
+        return true;
     }
     return false;
     return src0->ne[1] >= 8192;
