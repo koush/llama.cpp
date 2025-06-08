@@ -560,7 +560,7 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
     // if (reason && reason != src) {
     //     printf("Rejoining tensor for %s %s\n", ggml_op_name(reason->op), ggml_op_name(src->op));
     // }
-    printf("rejoining tensor %s for %s %s\n", src->name, reason ? ggml_op_name(reason->op) : "none", ggml_op_name(src->op));
+    // printf("rejoining tensor %s for %s %s\n", src->name, reason ? ggml_op_name(reason->op) : "none", ggml_op_name(src->op));
 
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(src->buffer->buft);
 
@@ -981,6 +981,7 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
 
 static enum ggml_status ggml_backend_tp_finish_init_tensor(ggml_tensor *tensor);
 static void ensure_weight_column_split(ggml_tensor * weight);
+static bool can_weight_column_split(ggml_tensor * weight);
 
 static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
     if (extra->initialized) {
@@ -1723,19 +1724,22 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                     set_src_tensor(1, GGML_TP_SPLIT_NONE);
                 }
                 else {
-                    // TODO: this path is disabled because column splitting quantized weights in MoE models often results in busted splits.
-
-                    // a weight matrix is multiplied by a column split tensor (prior to ROPE), it can be massaged to a column split.
-                    // this results in a reduce split.
-                    // ensure_weight_column_split(src0);
-                    // create_reduce_tensors();
-                    // set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
-                    // set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
-
-                    ensure_rejoined(tensor, src1);
-                    create_column_split_tensors();
-                    set_src_tensor(0, GGML_TP_SPLIT_ROWS);
-                    set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                    if (can_weight_column_split(src0)) {
+                        // a weight matrix is multiplied by a column split tensor (prior to ROPE), it can be massaged to a column split.
+                        // this results in a reduce split.
+                        ensure_weight_column_split(src0);
+                        create_reduce_tensors();
+                        set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
+                        set_src_tensor(1, GGML_TP_SPLIT_COLUMNS);
+                    }
+                    else {
+                        // some quantizations dimension combos result in an irregular number of quantization blocks.
+                        // this can be resolved by repacking the quantization i guess.
+                        ensure_rejoined(tensor, src1);
+                        create_column_split_tensors();
+                        set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                        set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                    }
                 }
             }
             else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src1_split_tensors == GGML_TP_SPLIT_COLUMNS) {
@@ -2298,6 +2302,31 @@ static ggml_split get_alloc_splits(size_t size) {
     return splits;
 }
 
+static bool can_weight_column_split(ggml_tensor * weight) {
+    if (weight->op != GGML_OP_NONE) {
+        return false;
+    }
+
+    auto extra = (ggml_tensor_parallel_extra *)weight->extra;
+    if (!extra->split_tensors) {
+        return false;
+    }
+
+    if (extra->split_tensors == GGML_TP_SPLIT_COLUMNS) {
+        return true;
+    }
+
+    auto block_size = ggml_blck_size(weight->type);
+    auto blocks_per_row = weight->ne[0] / block_size;
+    if (blocks_per_row % ggml_parallel_devices.size() != 0) {
+        // the weight tensor is not evenly divisible by the number of devices
+        return false;
+    }
+
+    return true;
+}
+
+
 static void ensure_weight_column_split(ggml_tensor * weight) {
     if (weight->op != GGML_OP_NONE) {
         return;
@@ -2359,10 +2388,11 @@ static void ensure_weight_column_split(ggml_tensor * weight) {
 
         auto be = ggml_parallel_backends[j];
         if (be->iface.set_tensor2d_async) {
-            be->iface.set_tensor2d_async(be, wrapped, data.get() + offset, wrapped->nb[1], wrapped->ne[1], weight->nb[1]);
+            // note that ne[2] is > 1 for moe models (number of experts). so the height is scaled with later dimensions.
+            be->iface.set_tensor2d_async(be, wrapped, data.get() + offset, wrapped->nb[1], wrapped->ne[1] * wrapped->ne[2] * wrapped->ne[3], weight->nb[1]);
         }
         else if (be->iface.set_tensor_async) {
-            for (int i = 0; i < weight->ne[1]; i++) {
+            for (int i = 0; i < wrapped->ne[1] * wrapped->ne[2] * wrapped->ne[3]; i++) {
                 be->iface.set_tensor_async(be, wrapped, data.get() + i * weight->nb[1] + offset, i * wrapped->nb[1], wrapped->nb[1]);
             }
         }
@@ -2371,7 +2401,7 @@ static void ensure_weight_column_split(ggml_tensor * weight) {
                 static_cast<char*>(std::malloc(wrapped->nb[3])), &std::free);
 
             // blit from the full memory to a split memory
-            for (int i = 0; i < weight->ne[1]; i++) {
+            for (int i = 0; i < wrapped->ne[1] * wrapped->ne[2] * wrapped->ne[3]; i++) {
                 memcpy(slice.get() + i * wrapped->nb[1], data.get() + i * weight->nb[1] + offset, wrapped->nb[1]);
             }
 
