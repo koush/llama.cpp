@@ -117,8 +117,8 @@ extern "C" {
 
         // (optional) asynchronous 2d tensor data access. useful for interleaved reads/writes when gathering for tensor parallel backend.
         // width, height, stride are in bytes, not elements.
-        void (*set_tensor2d_async)(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t width, size_t height, size_t stride);
-        void (*get_tensor2d_async)(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
+        void (*set_tensor2d_async)(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t width, size_t height, size_t in_stride, size_t out_stride);
+        void (*get_tensor2d_async)(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t width, size_t height, size_t in_stride, size_t out_stride);
         // cpy_tensor2d_async should handle 2d memcpy regardless of actual tensor layout. ie, if column and row is contiguous, but
         // sequence is present and batch is 1. this can be handled by a 2d memcpy by collapsing columns and rows into a single dimension
         // before calling the underlying 2d memcpy implementation.

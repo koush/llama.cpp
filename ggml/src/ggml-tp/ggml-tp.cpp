@@ -2347,18 +2347,19 @@ static void ensure_weight_column_split(ggml_tensor * weight) {
     std::unique_ptr<char, decltype(&std::free)> data(
         static_cast<char*>(std::malloc(size)), &std::free);
     size_t offset = 0;
+    auto row_splits = get_row_splits(weight);
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
         auto wrapped = extra->tensors[j];
-        auto buft = wrapped->buffer;
-        auto wrapped_size = ggml_nbytes(wrapped);
         auto be = ggml_parallel_backends[j];
-        if (be->iface.get_tensor_async) {
-            be->iface.get_tensor_async(be, wrapped, data.get() + offset, 0, wrapped_size);
+        if (!be->iface.get_tensor2d_async) {
+            GGML_ABORT("Tensor %s has no get_tensor_async interface for backend %s\n", weight->name, be->iface.get_name(be));
         }
-        else {
-            buft->iface.get_tensor(buft, wrapped, data.get() + offset, 0, wrapped_size);
-        }
-        offset += ggml_nbytes(wrapped);
+        auto split_expert_size = row_splits.split[j] * weight->nb[1];
+        auto expert_stride = weight->ne[1] * weight->nb[1];
+        // if this is moe, there will be multiple matrices per expert.
+        // flatten the split expert along the first dimension, and utilize the stride to copy in all the splits.
+        be->iface.get_tensor2d_async(be, wrapped, data.get() + offset, split_expert_size, weight->ne[2] * weight->ne[3], split_expert_size, expert_stride);
+        offset += split_expert_size;
     }
 
     for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -2387,36 +2388,18 @@ static void ensure_weight_column_split(ggml_tensor * weight) {
         wrapped->nb[3] = wrapped->nb[2] * wrapped->ne[2];
 
         auto be = ggml_parallel_backends[j];
-        if (be->iface.set_tensor2d_async) {
-            // note that ne[2] is > 1 for moe models (number of experts). so the height is scaled with later dimensions.
-            be->iface.set_tensor2d_async(be, wrapped, data.get() + offset, wrapped->nb[1], wrapped->ne[1] * wrapped->ne[2] * wrapped->ne[3], weight->nb[1]);
+        if (!be->iface.set_tensor2d_async) {
+            GGML_ABORT("Tensor %s has no set_tensor2d_async interface for backend %s\n", weight->name, be->iface.get_name(be));
         }
-        else if (be->iface.set_tensor_async) {
-            for (int i = 0; i < wrapped->ne[1] * wrapped->ne[2] * wrapped->ne[3]; i++) {
-                be->iface.set_tensor_async(be, wrapped, data.get() + i * weight->nb[1] + offset, i * wrapped->nb[1], wrapped->nb[1]);
-            }
-        }
-        else {
-            std::unique_ptr<char, decltype(&std::free)> slice(
-                static_cast<char*>(std::malloc(wrapped->nb[3])), &std::free);
-
-            // blit from the full memory to a split memory
-            for (int i = 0; i < wrapped->ne[1] * wrapped->ne[2] * wrapped->ne[3]; i++) {
-                memcpy(slice.get() + i * wrapped->nb[1], data.get() + i * weight->nb[1] + offset, wrapped->nb[1]);
-            }
-
-            // set the tensor from the split memory
-            auto buft = wrapped->buffer;
-            auto buft_size = ggml_nbytes(wrapped);
-            if (be->iface.set_tensor_async) {
-                be->iface.set_tensor_async(be, wrapped, slice.get(), 0, buft_size);
-            }
-            else {
-                buft->iface.set_tensor(buft, wrapped, slice.get(), 0, buft_size);
-            }
-        }
+        // note that ne[2] is > 1 for moe models (number of experts). so the height is scaled with later dimensions.
+        be->iface.set_tensor2d_async(be, wrapped, data.get() + offset, wrapped->nb[1], wrapped->ne[1] * wrapped->ne[2] * wrapped->ne[3], weight->nb[1], wrapped->nb[1]);
         // track the column offset
         offset += wrapped->nb[1];
+    }
+
+    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+        auto be = ggml_parallel_backends[j];
+        ggml_backend_synchronize(be);
     }
 }
 

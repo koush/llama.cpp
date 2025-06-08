@@ -3012,17 +3012,26 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
-static void ggml_backend_cuda_set_tensor2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t width, size_t height, size_t stride) {
+static void ggml_backend_cuda_set_tensor2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t width, size_t height, size_t in_stride, size_t out_stride) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpy2DAsync(tensor->data, tensor->nb[1], data, stride, width, height, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(cudaMemcpy2DAsync(tensor->data, out_stride, data, in_stride, width, height, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
 static bool ggml_backend_cuda_cpy_tensor2d_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     return ggml_backend_cuda_cpy_tensor2d_async_common(backend_src, backend_dst, src, dst, false);
+}
+
+static void ggml_backend_cuda_get_tensor2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t width, size_t height, size_t in_stride, size_t out_stride) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    CUDA_CHECK(cudaMemcpy2DAsync(data, out_stride, (char *)tensor->data, in_stride, width, height, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
 static const ggml_backend_i ggml_backend_cuda_interface = {
@@ -3040,7 +3049,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .set_tensor2d_async      = */ ggml_backend_cuda_set_tensor2d_async,
-    /* .get_tensor2d_async      = */ NULL,
+    /* .get_tensor2d_async      = */ ggml_backend_cuda_get_tensor2d_async,
     /* .cpy_tensor2d_async      = */ ggml_backend_cuda_cpy_tensor2d_async,
 };
 
