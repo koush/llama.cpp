@@ -560,7 +560,7 @@ static void ensure_rejoined(const ggml_tensor *reason, const ggml_tensor * src) 
     // if (reason && reason != src) {
     //     printf("Rejoining tensor for %s %s\n", ggml_op_name(reason->op), ggml_op_name(src->op));
     // }
-    // printf("rejoining tensor %s for %s %s\n", src->name, reason ? ggml_op_name(reason->op) : "none", ggml_op_name(src->op));
+    printf("rejoining tensor %s for %s %s\n", src->name, reason ? ggml_op_name(reason->op) : "none", ggml_op_name(src->op));
 
     const auto alignment = ggml_backend_tp_buffer_type_get_alignment(src->buffer->buft);
 
@@ -1863,13 +1863,12 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             }
             else {
                 // i'm not sure why the following code does not work, will need to investigate.
-                if (true) {
+                if (false) {
                     ensure_rejoined(tensor, src0);
                     create_default_tensors();
                     set_src_tensor(0, GGML_TP_SPLIT_NONE);
                 }
                 else if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS && src0->ne[0] == tensor->ne[0]) {
-                    // GGML_LOG_WARN("UNUSED CODE PATH VIEW SPLIT COL\n");
                     // column split tensor with no change to columns
                     create_column_split_tensors(true);
                     set_src_tensor(0, GGML_TP_SPLIT_COLUMNS);
@@ -2068,11 +2067,6 @@ static void ggml_backend_set_tensor_async_common(ggml_backend_buffer_t buffer, g
             auto split_size = (size_t) splits.split[j] * tensor->nb[1];
             auto split_expert_offset = n_expert * split_size;
             
-            GGML_ASSERT(split_expert_offset == n_expert * wrapped->nb[2]);
-            GGML_ASSERT(wrapped->nb[2] == split_size);
-            GGML_ASSERT(wrapped->ne[1] == splits.split[j]);  // confirm split row count
-            GGML_ASSERT(wrapped->ne[2] == tensor->ne[2]);    // unless you're splitting experts too
-
             if (be->iface.set_tensor_async) {
                 be->iface.set_tensor_async(be, wrapped, (const char *) data + data_expert_offset + data_row_offset, split_expert_offset, split_size);
             }
@@ -2442,10 +2436,8 @@ static enum ggml_status ggml_backend_tp_finish_init_tensor(ggml_tensor *tensor) 
             auto view_src_extra = (ggml_tensor_parallel_extra *)tensor->view_src->extra;
             auto view_src = view_src_extra->tensors[j];
             auto rem = tensor->view_offs % alignment;
-            auto view_offs = tensor->view_offs / alignment * device_alignment + rem;
             wrapped->data = (char *) view_src->data + wrapped->view_offs;
             wrapped->view_src = view_src;
-            wrapped->view_offs = view_offs;
             if (wrapped->view_src == NULL) {
                 GGML_ABORT("ggml_backend_tp_buffer_init_tensor: view_src is NULL for tensor %s\n", tensor->name);
             }
