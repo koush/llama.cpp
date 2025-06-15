@@ -817,7 +817,7 @@ static ggml_tensor* ggml_backend_tp_node_compute_split(int device_index, ggml_te
     auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
 
     auto wrapped = extra->tensors[device_index];
-    if (tensor->op != GGML_OP_ADD || extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
+    if ((tensor->op != GGML_OP_ADD && tensor->op != GGML_OP_SUB && tensor->op != GGML_OP_MUL && tensor->op != GGML_OP_DIV) || extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
        return wrapped;
     }
 
@@ -1023,10 +1023,10 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
         create_default_tensors_for(tensor, extra);
     };
 
-    auto create_reduce_tensors = [&]() {
+    auto create_reduce_tensors = [&](bool offset_aware = false) {
         extra->split_tensors = GGML_TP_SPLIT_REDUCE;
         for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-            auto wrapped = ggml_backend_tp_clone_tensor(tensor);
+            auto wrapped = ggml_backend_tp_clone_tensor(tensor, offset_aware);
             extra->tensors[j] = wrapped;
         }
     };
@@ -1113,12 +1113,12 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
 
         // one of these must be a reduce tensor, the other may be a split tensor, unsplit tensor, or even another reduce tensor.
         auto reduce_tensor = src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE ? src0 : src1;
-        auto add_tensor = src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE ? src1 : src0;
-        auto add_extra = (ggml_tensor_parallel_extra *)add_tensor->extra;
+        auto op_tensor = src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE ? src1 : src0;
+        auto op_extra = (ggml_tensor_parallel_extra *)op_tensor->extra;
         auto reduce_extra = (ggml_tensor_parallel_extra *)reduce_tensor->extra;
 
-        if (add_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
-            // double reduce add can simply be added without any views.
+        if (!op_extra->has_rejoin && op_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+            // double reduce add/sub can simply be performed without any views.
             for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
                 auto wrapped = extra->tensors[j];
                 auto reduce_op = ggml_backend_tp_clone_tensor(wrapped);
@@ -1129,10 +1129,10 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 reduce_op->data = wrapped->data;
 
                 reduce_op->src[0] = reduce_extra->has_rejoin ? reduce_extra->rejoined_tensor_views[j][j] : reduce_extra->tensors[j];
-                reduce_op->src[1] = add_extra->has_rejoin ? add_extra->rejoined_tensor_views[j][j] : add_extra->tensors[j];
+                reduce_op->src[1] = op_extra->has_rejoin ? op_extra->rejoined_tensor_views[j][j] : op_extra->tensors[j];
             }
         }
-        else {
+        else if (op_tensor->op == GGML_OP_ADD || op_tensor->op == GGML_OP_SUB) {
             auto splits = get_col_splits(tensor);
             size_t col_offset = 0;
 
@@ -1154,10 +1154,45 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 auto reduce_op_src_view = reduce_extra->reduce_split_views[j];
                 reduce_op->src[0] = reduce_op_src_view;
 
-                auto add = add_extra->split_tensors == GGML_TP_SPLIT_NONE ? add_extra->converted_tensors[j] : add_extra->tensors[j];
-                reduce_op->src[1] = add;
+                if (op_extra->split_tensors == GGML_TP_SPLIT_NONE) {
+                    // broadcast tensor
+                    if (op_tensor->ne[0] == 1) {
+                        reduce_op->src[1] = op_extra->tensors[j];
+                    }
+                    else {
+                        reduce_op->src[1] = op_extra->converted_tensors[j];
+                    }
+                }
+                else {
+                    reduce_op->src[1] = op_extra->tensors[j];
+                }
 
                 col_offset += splits.split[j];
+
+                if (!extra->reduce_op_tensors[j]->src[0] || !extra->reduce_op_tensors[j]->src[1]) {
+                    GGML_ABORT("ggml_backend_tp_buffer_init_tensor: reduce op tensor %s has no src\n", tensor->name);
+                }
+            }
+        }
+        else {
+            for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
+                auto wrapped = extra->tensors[j];
+
+                auto reduce_op = ggml_backend_tp_clone_tensor(wrapped);
+                extra->reduce_op_tensors[j] = reduce_op;
+                reduce_op->buffer = wrapped->buffer;
+                reduce_op->view_src = wrapped;
+                reduce_op->view_offs = 0;
+                reduce_op->data = (char *)wrapped->data + reduce_op->view_offs;
+
+                // muls and divs multiply both sides in full.
+                reduce_op->src[0] = reduce_extra->tensors[j];
+                if (op_extra->split_tensors == GGML_TP_SPLIT_NONE) {
+                    reduce_op->src[1] = op_extra->tensors[j];
+                }
+                else {
+                    reduce_op->src[1] = op_extra->converted_tensors[j];
+                }
 
                 if (!extra->reduce_op_tensors[j]->src[0] || !extra->reduce_op_tensors[j]->src[1]) {
                     GGML_ABORT("ggml_backend_tp_buffer_init_tensor: reduce op tensor %s has no src\n", tensor->name);
@@ -1433,6 +1468,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             check_srcs();
             break;
 
+        case GGML_OP_SUB:
         case GGML_OP_ADD: {
             no_split_view(src0, src0_extra);
             no_split_view(src1, src1_extra);
@@ -1561,7 +1597,6 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             break;
         }
 
-        case GGML_OP_SUB:
         case GGML_OP_DIV:
         case GGML_OP_MUL: {
             no_split_view(src0, src0_extra);
@@ -1570,12 +1605,29 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 GGML_ABORT("Tensor %s has view source tensors, which are not supported for tensor parallelism.\n", tensor->name);
             }
 
-            no_reduce(src0, src0_extra);
-            no_reduce(src1, src1_extra);
             auto src0_split_tensors = src0_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src0_extra->split_tensors;
             auto src1_split_tensors = src1_extra->has_rejoin ? GGML_TP_SPLIT_NONE : src1_extra->split_tensors;
 
-            if (src0_split_tensors == src1_split_tensors) {
+            if (src0_split_tensors == GGML_TP_SPLIT_REDUCE || src1_split_tensors == GGML_TP_SPLIT_REDUCE) {
+                // reduce tensors can be multiplied if only 1 is reduce and then the multiplication can happen in full on both
+                // split tensors.
+                if (src0_split_tensors == GGML_TP_SPLIT_REDUCE && !src1_split_tensors) {
+                    create_reduce_tensors();
+                    create_reduce_op_tensors();
+                }
+                else if (src1_split_tensors == GGML_TP_SPLIT_REDUCE && !src0_split_tensors) {
+                    create_reduce_tensors();
+                    create_reduce_op_tensors();
+                }
+                else {
+                    ensure_rejoined(tensor, src0);
+                    ensure_rejoined(tensor, src1);
+                    create_default_tensors();
+                    set_src_tensor(0, GGML_TP_SPLIT_NONE);
+                    set_src_tensor(1, GGML_TP_SPLIT_NONE);
+                }
+            }
+            else if (src0_split_tensors == src1_split_tensors) {
                 // spltis match
                 if (src0_split_tensors == GGML_TP_SPLIT_COLUMNS) {
                     ensure_column_split(src0);
@@ -1658,8 +1710,15 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 }
             }
 
-            GGML_ASSERT(ggml_are_same_shape(extra->tensors[0], extra->tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
-            GGML_ASSERT(extra->tensors[0]->ne[0] == extra->tensors[0]->src[0]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
+
+            if (extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+                GGML_ASSERT(ggml_are_same_shape(extra->reduce_op_tensors[0], extra->reduce_op_tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
+                GGML_ASSERT(extra->reduce_op_tensors[0]->src[0]->ne[0] == extra->reduce_op_tensors[0]->src[0]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne0).");
+            }
+            else {
+                GGML_ASSERT(ggml_are_same_shape(extra->tensors[0], extra->tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
+                GGML_ASSERT(extra->tensors[0]->src[0]->ne[0] == extra->tensors[0]->src[0]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne0).");
+            }
             break;
         }
 
@@ -1882,6 +1941,10 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                     // row split tensor with no change to rows
                     create_row_split_tensors();
                     set_src_tensor(0, GGML_TP_SPLIT_ROWS);
+                }
+                else if (src0_split_tensors == GGML_TP_SPLIT_REDUCE && src0->ne[0] == tensor->ne[0]) {
+                    // column split tensor with no change to columns
+                    create_reduce_tensors(true);
                 }
                 else {
                     has_init = true;
