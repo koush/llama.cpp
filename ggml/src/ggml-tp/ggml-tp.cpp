@@ -966,7 +966,6 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct ggml_cgraph * cgraph
 
         for (size_t device_index = 0; device_index < num_devices; device_index++) {
             auto backend_graph = backend_graphs[device_index];
-            auto device = ggml_parallel_devices[device_index];
 
             // once all peers are done, we can rejoin the tensors
             for (auto & pending : pending_gathers) {
