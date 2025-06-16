@@ -755,22 +755,6 @@ static void rejoin_tensor(const ggml_tensor * tensor, ggml_tensor_parallel_extra
     return rejoin_tensor_data(tensor, extra, nullptr);
 }
 
-typedef struct compute_thread {
-    int device_index;
-    struct ggml_cgraph * cgraph;
-    int end;
-    ggml_backend_tp_semaphore semaphore;
-    std::vector<struct compute_thread *> * peers;
-    std::mutex done;
-} compute_thread;
-
-static void release_peers(struct compute_thread * thread) {
-    for (size_t i = 0; i < thread->peers->size(); i++) {
-        auto t = thread->peers->at(i);
-        ggml_backend_tp_semaphore_release(&t->semaphore, 1);
-    }
-}
-
 static ggml_status reduce_gathered_tensors(ggml_cgraph * backend_graph, int device_index, const ggml_tensor * tensor) {
     auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
     if (extra->split_tensors != GGML_TP_SPLIT_REDUCE) {
@@ -862,111 +846,143 @@ static void ggml_backend_tp_buffer_compute_graph(ggml_cgraph * cgraph, std::func
     }
 }
 
-static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thread) {
+static void ggml_backend_tp_buffer_graph_compute_one(struct ggml_cgraph * cgraph) {
     auto startTime = std::chrono::high_resolution_clock::now();
     GGML_UNUSED(startTime);
-    auto cgraph = thread->cgraph;
 
-    struct ggml_init_params params = {
-        /* .mem_size   = */ ggml_tensor_overhead()*(cgraph->n_nodes + cgraph->n_leafs)*4 + ggml_graph_overhead_custom(cgraph->size, false),
-        /* .mem_buffer = */ NULL,
-        /* .no_alloc   = */ true
-    };
-    ggml_context_ptr ctx_ptr { ggml_init(params) };
-    auto ctx = ctx_ptr.get();
-    struct ggml_cgraph * backend_graph = ggml_new_graph_custom(ctx, cgraph->size, false);
-    auto device_index = thread->device_index;
-    auto be = ggml_parallel_backends[device_index];
+    auto num_devices = ggml_parallel_devices.size();
 
-    if (!be->iface.cpy_tensor2d_async) {
-        GGML_ABORT("Backend %s does not support async tensor copy.\n", be->iface.get_name(be));
+    struct ggml_cgraph * backend_graphs[TP_MAX_DEVICES];
+    struct ggml_context * backend_contexts[TP_MAX_DEVICES];
+    struct ggml_backend_event * backend_events[TP_MAX_DEVICES];
+
+    for (size_t i = 0; i < num_devices; i++) {
+        struct ggml_init_params params = {
+            /* .mem_size   = */ num_devices * (ggml_tensor_overhead()*(cgraph->n_nodes + cgraph->n_leafs)*4 + ggml_graph_overhead_custom(cgraph->size, false)),
+            /* .mem_buffer = */ NULL,
+            /* .no_alloc   = */ true
+        };
+        backend_contexts[i] = ggml_init(params);
+
+        auto be = ggml_parallel_backends[i];
+        if (!be->iface.cpy_tensor2d_async) {
+            GGML_ABORT("Backend %s does not support async tensor copy.\n", be->iface.get_name(be));
+        }
+
+        auto ctx = backend_contexts[i];
+        backend_graphs[i] = ggml_new_graph_custom(ctx, cgraph->size, false);
+        backend_graphs[i]->n_nodes = 0;
+
+        auto device = ggml_parallel_devices[i];
+        if (device->iface.event_new) {
+            backend_events[i] = device->iface.event_new(device);
+        }
     }
 
     int rejoins = 0;
 
     auto flush_compute = [&](int node_index, std::set<ggml_tensor*> pending_gathers) {
-        if (backend_graph->n_nodes ) {
-            auto status = be->iface.graph_compute(be, backend_graph);
-            // if (device_index == 0) {
-            //     for (int i = 0; i < backend_graph->n_nodes; i++) {
-            //         auto tensor = backend_graph->nodes[i];
-            //         printf("TP %d: %s %s %x\n", node_index - backend_graph->n_nodes + i, ggml_op_name(tensor->op), tensor->name, tensor->data);
-            //         for (int j = 0; j < GGML_MAX_SRC; j++) {
-            //             auto src = tensor->src[j];
-            //             if (!src) {
-            //                 break;
-            //             }
-            //             if (src) {
-            //                 printf("  src %d: %s %s %x\n", j, ggml_op_name(src->op), src->name, src->data);
-            //             }
-            //         }
-            //     }
-            // }
-            if (status != GGML_STATUS_SUCCESS) {
-                GGML_ABORT("Backend %s failed to compute graph %d with status %d\n", be->iface.get_name(be), node_index, status);
-            }
-            backend_graph->n_nodes = 0;
-        }
-        thread->end = node_index;
+        for (size_t device_index = 0; device_index < num_devices; device_index++) {
+            auto backend_graph = backend_graphs[device_index];
+            auto be = ggml_parallel_backends[device_index];
 
-        for (auto & tensor : pending_gathers) {
-            // why does this happen?
-            if (tensor->ne[0] == 0 || tensor->ne[1] == 0 || tensor->ne[2] == 0 || tensor->ne[3] == 0) {
-                continue;
+            if (backend_graph->n_nodes ) {
+                auto status = be->iface.graph_compute(be, backend_graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    GGML_ABORT("Backend %s failed to compute graph %d with status %d\n", be->iface.get_name(be), node_index, status);
+                }
+                backend_graph->n_nodes = 0;
             }
 
-            auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
-            auto wrapped = extra->tensors[device_index];
-
-            // async copies
-            for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
-                auto other_be = ggml_parallel_backends[other_device_index];
-                auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
-                if (!rejoined_tensor_view) {
-                    break;
+            for (auto & tensor : pending_gathers) {
+                // why does this happen?
+                if (tensor->ne[0] == 0 || tensor->ne[1] == 0 || tensor->ne[2] == 0 || tensor->ne[3] == 0) {
+                    continue;
                 }
 
-                auto view_src = wrapped;
-                while (view_src->view_src) {
-                    view_src = view_src->view_src;
+                auto extra = (ggml_tensor_parallel_extra *)tensor->extra;
+                auto wrapped = extra->tensors[device_index];
+
+                // async copies
+                for (size_t other_device_index = 0; other_device_index < ggml_parallel_devices.size(); other_device_index++) {
+                    auto other_be = ggml_parallel_backends[other_device_index];
+                    auto rejoined_tensor_view = extra->rejoined_tensor_views[other_device_index][device_index];
+                    if (!rejoined_tensor_view) {
+                        break;
+                    }
+
+                    auto view_src = wrapped;
+                    while (view_src->view_src) {
+                        view_src = view_src->view_src;
+                    }
+                    if (!be->iface.cpy_tensor2d_async(be, other_be, view_src, rejoined_tensor_view)) {
+                        GGML_ABORT("Failed to copy tensor %s from device %ld to device %ld\n", tensor->name, device_index, other_device_index);
+                        // TODO, this is recoverable if something like this is implemented:
+                        // ggml_backend_tensor2d_copy(view_src, rejoined_tensor_view);
+                    }
                 }
-                if (!be->iface.cpy_tensor2d_async(be, other_be, view_src, rejoined_tensor_view)) {
-                    GGML_ABORT("Failed to copy tensor %s from device %d to device %ld\n", tensor->name, device_index, other_device_index);
-                    // TODO, this is recoverable if something like this is implemented:
-                    // ggml_backend_tensor2d_copy(view_src, rejoined_tensor_view);
-                }
+            }
+
+            if (backend_events[device_index]) {
+                be->iface.event_record(be, backend_events[device_index]);
             }
         }
     };
 
     auto gather_pending = [&](int node_index, std::set<ggml_tensor*> pending_gathers) {
         rejoins++;
-        // synchronize self and then release peers
-        ggml_backend_synchronize(be);
-        release_peers(thread);
 
-        // wait for everyone else
-        for (size_t i = 0; i < thread->peers->size(); i++) {
-            ggml_backend_tp_semaphore_acquire(&thread->semaphore);
+        bool need_synchonize[TP_MAX_DEVICES];
+
+        for (size_t device_index = 0; device_index < num_devices; device_index++) {
+            auto device = ggml_parallel_devices[device_index];
+
+            for (size_t other_device_index = 0; other_device_index < num_devices; other_device_index++) {
+                if (other_device_index == device_index) {
+                    continue;
+                }
+
+                auto other_device = ggml_parallel_devices[other_device_index];
+                if (other_device->reg != device->reg) {
+                    need_synchonize[device_index] = true;
+                }
+                else {
+                    auto other_backend = ggml_parallel_backends[other_device_index];
+                    other_backend->iface.event_wait(other_backend, backend_events[device_index]);
+                }
+            }
         }
 
-        // once all peers are done, we can rejoin the tensors
-        for (auto & pending : pending_gathers) {
-            reduce_gathered_tensors(backend_graph, device_index, pending);
-            auto pending_extra = (ggml_tensor_parallel_extra *)pending->extra;
-            pending_extra->rejoined[device_index] = true;
+        for (size_t device_index = 0; device_index < num_devices; device_index++) {
+            if (need_synchonize[device_index]) {
+                ggml_backend_synchronize(ggml_parallel_backends[device_index]);
+            }
+        }
+
+        for (size_t device_index = 0; device_index < num_devices; device_index++) {
+            auto backend_graph = backend_graphs[device_index];
+            auto device = ggml_parallel_devices[device_index];
+
+            // once all peers are done, we can rejoin the tensors
+            for (auto & pending : pending_gathers) {
+                reduce_gathered_tensors(backend_graph, device_index, pending);
+                auto pending_extra = (ggml_tensor_parallel_extra *)pending->extra;
+                pending_extra->rejoined[device_index] = true;
+            }
         }
         return true;
         GGML_UNUSED(node_index);
     };
 
     auto compute = [&](int node_index, ggml_tensor * tensor, ggml_tensor_parallel_extra * extra) {
-        auto wrapped = ggml_backend_tp_node_compute_split(device_index, tensor);
-        if (extra->split_tensors != GGML_TP_SPLIT_VIEW) {
-            backend_graph->nodes[backend_graph->n_nodes++] = wrapped;
+        for (size_t device_index = 0; device_index < num_devices; device_index++) {
+            auto backend_graph = backend_graphs[device_index];
+            auto wrapped = ggml_backend_tp_node_compute_split(device_index, tensor);
+            if (extra->split_tensors != GGML_TP_SPLIT_VIEW) {
+                backend_graph->nodes[backend_graph->n_nodes++] = wrapped;
+            }
+            extra->computed[device_index] = true;
         }
-        extra->computed[device_index] = true;
-
         return true;
         GGML_UNUSED(node_index);
     };
@@ -974,9 +990,16 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct compute_thread * thr
     ggml_backend_tp_buffer_compute_graph(cgraph, gather_pending, compute, flush_compute);
     flush_compute(cgraph->n_nodes, std::set<ggml_tensor*>());
 
-    thread->done.unlock();
+    for (size_t device_index = 0; device_index < num_devices; device_index++) {
+        ggml_free(backend_contexts[device_index]);
 
-    // printf("TP graph %d compute time: %ld us %d rejoins\n", device_index, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count(), rejoins);
+        if (backend_events[device_index]) {
+            auto device = ggml_parallel_devices[device_index];
+            device->iface.event_free(device, backend_events[device_index]);
+        }
+    }
+
+    // printf("TP graph compute time: %ld us %d rejoins\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - startTime).count(), rejoins);
 }
 
 static enum ggml_status ggml_backend_tp_finish_init_tensor(ggml_tensor *tensor);
@@ -2056,40 +2079,11 @@ static enum ggml_status ggml_backend_tp_graph_compute(ggml_backend_t backend, gg
         }
     }
 
-
-    std::vector<struct compute_thread *> threads;
-    for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-        auto thread = new compute_thread();
-        thread->device_index = j;
-        thread->cgraph = cgraph;
-        thread->peers = &threads;
-        thread->done.lock();
-        threads.push_back(thread);
-    }
-
-    for (auto thread : threads) {
-        ggml_backend_tp_threadpool_enqueue(&ggml_device_threadpool, (thread_task_func)ggml_backend_tp_buffer_graph_compute_one, thread);
-    }
-
-    bool failed = false;
-    for (auto thread : threads) {
-        thread->done.lock();
-        if (thread->end != cgraph->n_nodes) {
-            failed = true;
-            break;
-        }
-    }
-
-
-    // for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
-    //     auto be = ggml_parallel_backends[j];
-    //     ggml_backend_synchronize(be);
-    // }
-
+    ggml_backend_tp_buffer_graph_compute_one(cgraph);
     // auto endTime = std::chrono::high_resolution_clock::now();
     // printf("TP graph compute took %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count());
 
-    return failed ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+    return GGML_STATUS_SUCCESS;
 
     GGML_UNUSED(backend);
 }
@@ -2521,7 +2515,6 @@ static enum ggml_status ggml_backend_tp_finish_init_tensor(ggml_tensor *tensor) 
             }
             auto view_src_extra = (ggml_tensor_parallel_extra *)tensor->view_src->extra;
             auto view_src = view_src_extra->tensors[j];
-            auto rem = tensor->view_offs % alignment;
             wrapped->data = (char *) view_src->data + wrapped->view_offs;
             wrapped->view_src = view_src;
             if (wrapped->view_src == NULL) {
