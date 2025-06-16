@@ -1205,6 +1205,8 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                     GGML_ABORT("ggml_backend_tp_buffer_init_tensor: reduce op tensor %s has no src\n", tensor->name);
                 }
             }
+
+            GGML_ASSERT(extra->reduce_op_tensors[0]->ne[0] == extra->reduce_op_tensors[0]->src[1]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
         }
         else {
             for (size_t j = 0; j < ggml_parallel_devices.size(); j++) {
@@ -1236,8 +1238,6 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 }
             }
         }
-
-        GGML_ASSERT(extra->reduce_op_tensors[0]->ne[0] == extra->reduce_op_tensors[0]->src[1]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
     };
 
     auto no_reduce = [&](ggml_tensor *src, ggml_tensor_parallel_extra *src_extra) {
