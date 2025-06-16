@@ -942,6 +942,11 @@ static void ggml_backend_tp_buffer_graph_compute_one(struct ggml_cgraph * cgraph
                     continue;
                 }
 
+                if (!backend_events[device_index]) {
+                    need_synchonize[device_index] = true;
+                    continue;
+                }
+
                 auto other_device = ggml_parallel_devices[other_device_index];
                 if (other_device->reg != device->reg) {
                     need_synchonize[device_index] = true;
