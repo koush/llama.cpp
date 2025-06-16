@@ -1132,7 +1132,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 reduce_op->src[1] = op_extra->has_rejoin ? op_extra->rejoined_tensor_views[j][j] : op_extra->tensors[j];
             }
         }
-        else if (op_tensor->op == GGML_OP_ADD || op_tensor->op == GGML_OP_SUB) {
+        else if (tensor->op == GGML_OP_ADD || tensor->op == GGML_OP_SUB) {
             auto splits = get_col_splits(tensor);
             size_t col_offset = 0;
 
@@ -1163,6 +1163,11 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                         reduce_op->src[1] = op_extra->converted_tensors[j];
                     }
                 }
+                else if (op_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+                    ensure_reduce_split_views(op_tensor);
+                    auto op_src_view = op_extra->reduce_split_views[j];
+                    reduce_op->src[1] = op_src_view;
+                }
                 else {
                     reduce_op->src[1] = op_extra->tensors[j];
                 }
@@ -1190,6 +1195,11 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                 if (op_extra->split_tensors == GGML_TP_SPLIT_NONE) {
                     reduce_op->src[1] = op_extra->tensors[j];
                 }
+                else if (op_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+                    ensure_reduce_split_views(op_tensor);
+                    auto op_src_view = op_extra->reduce_split_views[j];
+                    reduce_op->src[1] = op_src_view;
+                }
                 else {
                     reduce_op->src[1] = op_extra->converted_tensors[j];
                 }
@@ -1200,6 +1210,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             }
         }
 
+        GGML_ASSERT(extra->reduce_op_tensors[0]->ne[0] == extra->reduce_op_tensors[0]->src[1]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
     };
 
     auto no_reduce = [&](ggml_tensor *src, ggml_tensor_parallel_extra *src_extra) {
@@ -1519,7 +1530,7 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
                     GGML_ABORT("Tensor %s has unsupported op %s for tensor parallelism, src0 is split as %d but src1 is split as %d.\n", tensor->name, ggml_op_name(tensor->op), src0_split_tensors, src1_split_tensors);
                 }
             }
-            else if (src0_extra->split_tensors == GGML_TP_SPLIT_REDUCE && src1_extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
+            else if (src0_split_tensors == GGML_TP_SPLIT_REDUCE && src1_split_tensors == GGML_TP_SPLIT_REDUCE) {
                 create_reduce_tensors();
                 create_reduce_op_tensors();
             }
@@ -1558,7 +1569,6 @@ static void do_init(size_t node_index, ggml_tensor * tensor, ggml_tensor_paralle
             if (extra->split_tensors == GGML_TP_SPLIT_REDUCE) {
                 GGML_ASSERT(ggml_are_same_shape(extra->reduce_op_tensors[0], extra->reduce_op_tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
                 GGML_ASSERT(extra->reduce_op_tensors[0]->src[0]->ne[0] == extra->reduce_op_tensors[0]->src[0]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne0).");
-                GGML_ASSERT(extra->reduce_op_tensors[0]->ne[0] == extra->reduce_op_tensors[0]->src[1]->ne[0] && "Tensor parallel has incorrect broadcast dimension (ne1).");
             }
             else {
                 GGML_ASSERT(ggml_are_same_shape(extra->tensors[0], extra->tensors[0]->src[0]) && "Tensor parallel tensors must have the same shape.");
