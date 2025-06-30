@@ -1905,6 +1905,7 @@ static struct ggml_tensor * ggml_add_impl(
         struct ggml_tensor  * b,
         bool                  inplace) {
     GGML_ASSERT(ggml_can_repeat(b, a));
+    GGML_ASSERT(a->type == b->type);
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
@@ -4480,7 +4481,7 @@ struct ggml_tensor * ggml_pool_2d(
         a->ne[2],
         a->ne[3],
     };
-    result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result = ggml_new_tensor(ctx, a->type, 4, ne);
 
     int32_t params[] = { op, k0, k1, s0, s1, p0, p1 };
     ggml_set_op_params(result, params, sizeof(params));
